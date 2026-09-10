@@ -772,18 +772,33 @@ elif seccion == "🎁 Por cobrar":
 
     if len(pend):
         st.subheader("Registrar un abono")
+        tot_pers = (pend.groupby("PERSONA")
+                    .agg(SALDO=("SALDO", "sum"), N=("SALDO", "size")).reset_index()
+                    .sort_values("SALDO", ascending=False))
         etiquetas = {
-            f"{r.PERSONA} · {r.TIPO.lower()}"
-            + (f" · {r.DESCRIPCION}" if r.DESCRIPCION else "")
-            + f" · debe {money(r.SALDO)}": r.Index
-            for r in pend.sort_values("SALDO", ascending=False).itertuples()
+            f"{r.PERSONA} · debe {money(r.SALDO)}"
+            + (f" · {int(r.N)} cuentas" if r.N > 1 else ""): r.PERSONA
+            for r in tot_pers.itertuples()
         }
-        sel = st.selectbox("Cuenta", list(etiquetas.keys()), label_visibility="collapsed")
-        idx = etiquetas[sel]
-        saldo = float(ENC.loc[idx, "SALDO"])
+        sel = st.selectbox("Persona", list(etiquetas.keys()), label_visibility="collapsed")
+        quien = etiquetas[sel]
+        cuentas = pend[pend["PERSONA"] == quien].sort_values("FECHA", na_position="first")
+
+        destino = "TODAS"
+        if len(cuentas) > 1:
+            ops = {"Repartir entre sus cuentas, de la más antigua primero": "TODAS"}
+            for r in cuentas.itertuples():
+                ops[f"Solo: {r.TIPO.lower()}"
+                    + (f" · {r.DESCRIPCION}" if r.DESCRIPCION else "")
+                    + f" · debe {money(r.SALDO)}"] = r.Index
+            destino = ops[st.selectbox("Aplicar a", list(ops.keys()))]
+
+        saldo = (float(cuentas["SALDO"].sum()) if destino == "TODAS"
+                 else float(ENC.loc[destino, "SALDO"]))
+
         with st.form("abono", clear_on_submit=True):
             c = st.columns([2, 1, 2])
-            monto = c[0].number_input("Abono $", min_value=0.0, max_value=float(saldo),
+            monto = c[0].number_input("Abono $", min_value=0.0, max_value=saldo,
                                       step=1.0, value=0.0,
                                       help=f"Debe {money(saldo)}. Marca 'Saldó todo' "
                                            "si te pagó completo.")
@@ -794,12 +809,22 @@ elif seccion == "🎁 Por cobrar":
                     st.error("El abono debe ser mayor que cero.")
                 else:
                     df = leer("ENCARGOS")
-                    df.loc[idx, "ABONADO"] = float(df.loc[idx, "ABONADO"] or 0) + pago
+                    if destino == "TODAS":
+                        resto = pago
+                        for idx in cuentas.index:
+                            if resto <= 0.004:
+                                break
+                            aplica = min(resto, float(ENC.loc[idx, "SALDO"]))
+                            df.loc[idx, "ABONADO"] = float(df.loc[idx, "ABONADO"] or 0) + aplica
+                            resto -= aplica
+                    else:
+                        df.loc[destino, "ABONADO"] = (
+                            float(df.loc[destino, "ABONADO"] or 0) + pago)
                     guardar("ENCARGOS", df)
                     resta = saldo - pago
-                    st.success(f"Abono de {money(pago)} registrado. "
-                               + ("Cuenta saldada." if resta <= 0.004
-                                  else f"Queda debiendo {money(resta)}.")
+                    st.success(f"Abono de {money(pago)} de {quien}. "
+                               + ("Queda al día." if resta <= 0.004
+                                  else f"Le queda debiendo {money(resta)}.")
                                + " Acuérdate de sumarlo en Caja Chica.")
                     st.rerun()
 
