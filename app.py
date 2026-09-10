@@ -889,36 +889,51 @@ elif seccion == "🎁 Por cobrar":
     elif estado == "Saldados":
         e = e[e["ESTA_PAGADO"]]
 
-    st.dataframe(
-        e[["PERSONA", "TIPO", "DESCRIPCION", "COSTO", "COBRAR", "ABONADO", "SALDO",
-           "GANANCIA", "FECHA", "NOTA"]].sort_values(["SALDO", "PERSONA"], ascending=False),
-        width="stretch", hide_index=True, height=340,
-        column_config={
-            "COSTO": st.column_config.NumberColumn(format="$%.2f"),
-            "COBRAR": st.column_config.NumberColumn(format="$%.2f"),
-            "ABONADO": st.column_config.NumberColumn(format="$%.2f"),
-            "SALDO": st.column_config.NumberColumn(format="$%.2f"),
-            "GANANCIA": st.column_config.NumberColumn(format="$%.2f"),
-            "FECHA": st.column_config.DateColumn(format="DD/MM/YYYY"),
-        },
-    )
+    detalle = st.checkbox("Ver cuenta por cuenta", value=False)
 
-    resumen = (ENC[~ENC["ESTA_PAGADO"]].groupby("PERSONA")
-               .agg(CUENTAS=("SALDO", "size"), ABONADO=("ABONADO", "sum"),
-                    DEBE=("SALDO", "sum")).reset_index()
-               .sort_values("DEBE", ascending=False))
-    if len(resumen):
-        c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("Quién debe")
-            st.dataframe(resumen, width="stretch", hide_index=True, height=300,
-                         column_config={
-                             "ABONADO": st.column_config.NumberColumn(format="$%.2f"),
-                             "DEBE": st.column_config.NumberColumn(format="$%.2f")})
-        with c2:
-            st.subheader(" ")
-            st.plotly_chart(px.bar(resumen.sort_values("DEBE"), x="DEBE", y="PERSONA",
-                                   orientation="h"), width="stretch")
+    if detalle:
+        st.dataframe(
+            e[["PERSONA", "TIPO", "DESCRIPCION", "COSTO", "COBRAR", "ABONADO", "SALDO",
+               "GANANCIA", "FECHA", "NOTA"]].sort_values(["SALDO", "PERSONA"],
+                                                         ascending=False),
+            width="stretch", hide_index=True, height=360,
+            column_config={
+                "COSTO": st.column_config.NumberColumn(format="$%.2f"),
+                "COBRAR": st.column_config.NumberColumn(format="$%.2f"),
+                "ABONADO": st.column_config.NumberColumn(format="$%.2f"),
+                "SALDO": st.column_config.NumberColumn(format="$%.2f"),
+                "GANANCIA": st.column_config.NumberColumn(format="$%.2f"),
+                "FECHA": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            },
+        )
+    elif len(e):
+        tot = (e.groupby("PERSONA")
+               .agg(CUENTAS=("COBRAR", "size"), COBRAR=("COBRAR", "sum"),
+                    ABONADO=("ABONADO", "sum"), SALDO=("SALDO", "sum"),
+                    GANANCIA=("GANANCIA", "sum"))
+               .reset_index().sort_values("SALDO", ascending=False))
+        tipos = e.groupby("PERSONA")["TIPO"].agg(lambda s: " + ".join(sorted(set(s))))
+        tot["TIPO"] = tot["PERSONA"].map(tipos)
+        tot = tot[["PERSONA", "TIPO", "CUENTAS", "COBRAR", "ABONADO", "SALDO", "GANANCIA"]]
+        st.dataframe(
+            tot, width="stretch", hide_index=True, height=360,
+            column_config={
+                "COBRAR": st.column_config.NumberColumn(format="$%.2f"),
+                "ABONADO": st.column_config.NumberColumn(format="$%.2f"),
+                "SALDO": st.column_config.NumberColumn(format="$%.2f"),
+                "GANANCIA": st.column_config.NumberColumn(format="$%.2f"),
+            },
+        )
+        st.caption(f"{len(tot)} personas · {len(e)} cuentas · saldo "
+                   f"{money(tot['SALDO'].sum())}")
+
+        if len(tot) > 1:
+            st.plotly_chart(
+                px.bar(tot.sort_values("SALDO"), x="SALDO", y="PERSONA", orientation="h",
+                       labels={"SALDO": "$", "PERSONA": ""}),
+                width="stretch")
+    else:
+        st.info("Nada que mostrar con esos filtros.")
 
     with st.expander("✏️ Editar"):
         edit = st.data_editor(
