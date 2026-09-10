@@ -784,7 +784,9 @@ elif seccion == "🎁 Por cobrar":
         with st.form("abono", clear_on_submit=True):
             c = st.columns([2, 1, 2])
             monto = c[0].number_input("Abono $", min_value=0.0, max_value=float(saldo),
-                                      step=1.0, value=float(saldo))
+                                      step=1.0, value=0.0,
+                                      help=f"Debe {money(saldo)}. Marca 'Saldó todo' "
+                                           "si te pagó completo.")
             todo = c[1].checkbox("Saldó todo")
             if c[2].form_submit_button("Registrar abono", type="primary"):
                 pago = saldo if todo else monto
@@ -804,11 +806,22 @@ elif seccion == "🎁 Por cobrar":
     st.divider()
     tipo = st.radio("Registrar algo nuevo", ["Encargo", "Préstamo"], horizontal=True)
     with st.expander(f"➕ Nuevo {tipo.lower()}", expanded=ENC.empty):
+        conocidas = sorted(x for x in ENC["PERSONA"].unique() if x) if len(ENC) else []
+        c = st.columns([2, 3])
+        elegida = c[0].selectbox("Persona", ["➕ Nueva persona"] + conocidas,
+                                 key=f"sel_persona_{tipo}")
+        if elegida == "➕ Nueva persona":
+            persona = c[1].text_input("Nombre de la persona nueva",
+                                      key=f"nueva_persona_{tipo}").strip().upper()
+        else:
+            persona = elegida
+            deuda = ENC[(ENC["PERSONA"] == persona) & (~ENC["ESTA_PAGADO"])]["SALDO"].sum()
+            if deuda:
+                c[1].caption(f"Ya debe {money(deuda)} en {len(ENC[(ENC['PERSONA'] == persona) & (~ENC['ESTA_PAGADO'])])} cuenta(s).")
+
         if tipo == "Encargo":
             with st.form("nuevo_encargo", clear_on_submit=True):
-                c = st.columns([2, 3])
-                persona = c[0].text_input("Persona").strip().upper()
-                desc = c[1].text_input("Qué pidió")
+                desc = st.text_input("Qué pidió")
                 c = st.columns(4)
                 costo = c[0].number_input("Costo $ (lo que gastaste)", min_value=0.0, step=0.5)
                 cobrar = c[1].number_input("Cobrar $", min_value=0.0, step=1.0)
@@ -831,10 +844,9 @@ elif seccion == "🎁 Por cobrar":
                         st.rerun()
         else:
             with st.form("nuevo_prestamo", clear_on_submit=True):
-                c = st.columns([2, 1, 1])
-                persona = c[0].text_input("Persona").strip().upper()
-                prestado = c[1].number_input("Monto prestado $", min_value=0.0, step=1.0)
-                cobrar = c[2].number_input("A cobrar $", min_value=0.0, step=1.0,
+                c = st.columns(2)
+                prestado = c[0].number_input("Monto prestado $", min_value=0.0, step=1.0)
+                cobrar = c[1].number_input("A cobrar $", min_value=0.0, step=1.0,
                                            help="Igual al prestado si no cobras interés.")
                 c = st.columns([1, 1, 3])
                 abonado = c[0].number_input("Ya abonó $", min_value=0.0, step=1.0)
