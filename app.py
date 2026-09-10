@@ -985,37 +985,74 @@ elif seccion == "💵 Caja Chica":
     k[0].metric("Total", money(caja["MONTO"].sum()))
     k[1].metric("Ubicaciones", len(caja))
 
-    with st.form("nueva_caja", clear_on_submit=True):
-        c = st.columns([2, 1, 1, 1])
-        u = c[0].text_input("Ubicación").strip().upper()
-        m = c[1].number_input("Monto", step=1.0, value=0.0)
+    st.subheader("Movimiento")
+    ubis = sorted(x for x in caja["UBICACION"].unique() if x)
+    c = st.columns([2, 2])
+    destino = c[0].selectbox("Ubicación", ubis + ["➕ Nueva ubicación"],
+                             key="caja_ubi")
+    if destino == "➕ Nueva ubicación":
+        nombre = c[1].text_input("Nombre de la ubicación", key="caja_nueva").strip().upper()
+        actual = 0.0
+    else:
+        nombre = destino
+        actual = float(caja.loc[caja["UBICACION"] == nombre, "MONTO"].sum())
+        c[1].caption(f"Tiene {money(actual)}.")
+
+    with st.form("mov_caja", clear_on_submit=True):
+        c = st.columns([1, 1, 1, 1])
+        signo = c[0].radio("Tipo", ["Entrada", "Salida"], horizontal=True)
+        monto = c[1].number_input("Monto $", min_value=0.0, step=1.0, value=0.0)
         mo = c[2].selectbox("Moneda", ["$", "Bs"])
-        t = c[3].number_input("Tasa", step=0.01, value=0.0)
-        if st.form_submit_button("Agregar / actualizar", type="primary"):
-            if not u:
+        tasa = c[3].number_input("Tasa", min_value=0.0, step=0.01, value=0.0,
+                                 help="Solo si la ubicación maneja bolívares.")
+        if st.form_submit_button("Aplicar", type="primary"):
+            if not nombre:
                 st.error("Falta la ubicación.")
+            elif monto <= 0:
+                st.error("El monto debe ser mayor que cero.")
             else:
-                df = leer("CAJA")
-                if u in set(df["UBICACION"]):
-                    df.loc[df["UBICACION"] == u, ["MONTO", "MONEDA", "TASA"]] = [m, mo, t or None]
+                cambio = monto if signo == "Entrada" else -monto
+                nuevo_saldo = actual + cambio
+                if nuevo_saldo < 0:
+                    st.error(f"No alcanza: {nombre} tiene {money(actual)} y quieres "
+                             f"sacar {money(monto)}.")
                 else:
-                    df = pd.concat([df, pd.DataFrame([{"UBICACION": u, "MONTO": m,
-                                                       "MONEDA": mo, "TASA": t or None}])],
-                                   ignore_index=True)
-                guardar("CAJA", df)
-                st.rerun()
+                    df = leer("CAJA")
+                    if nombre in set(df["UBICACION"]):
+                        df.loc[df["UBICACION"] == nombre, "MONTO"] = nuevo_saldo
+                        df.loc[df["UBICACION"] == nombre, "MONEDA"] = mo
+                        if tasa:
+                            df.loc[df["UBICACION"] == nombre, "TASA"] = tasa
+                    else:
+                        df = pd.concat([df, pd.DataFrame([{
+                            "UBICACION": nombre, "MONTO": nuevo_saldo, "MONEDA": mo,
+                            "TASA": tasa or None}])], ignore_index=True)
+                    guardar("CAJA", df)
+                    st.success(f"{signo} de {money(monto)} en {nombre}. "
+                               f"Queda {money(nuevo_saldo)}.")
+                    st.rerun()
 
-    edit = st.data_editor(caja, num_rows="dynamic", width="stretch", key="ed_caja")
-    if st.button("💾 Guardar caja", type="primary"):
-        guardar("CAJA", edit)
-        st.success("Caja actualizada.")
-        st.rerun()
+    st.divider()
+    with st.expander("✏️ Editar saldos directamente"):
+        st.caption("Para corregir un saldo a mano o eliminar una ubicación.")
+        edit = st.data_editor(caja, num_rows="dynamic", width="stretch", key="ed_caja",
+                              column_config={
+                                  "MONTO": st.column_config.NumberColumn(format="%.2f"),
+                                  "MONEDA": st.column_config.SelectboxColumn(
+                                      options=["$", "Bs"]),
+                                  "TASA": st.column_config.NumberColumn(format="%.2f")})
+        if st.button("💾 Guardar caja", type="primary"):
+            guardar("CAJA", edit)
+            st.success("Caja actualizada.")
+            st.rerun()
 
-    if not caja.empty:
+    con_saldo = caja[caja["MONTO"] > 0]
+    if len(con_saldo):
         st.plotly_chart(
-            px.pie(caja, values="MONTO", names="UBICACION", hole=0.45),
+            px.pie(con_saldo, values="MONTO", names="UBICACION", hole=0.45),
             width="stretch",
         )
+
 
 # --------------------------------------------------------------------------
 # HISTORICO (archivo viejo, lotes 1-10)
