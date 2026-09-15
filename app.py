@@ -564,7 +564,8 @@ elif seccion == "🧾 Ventas":
             with st.form("venta_libre", clear_on_submit=True):
                 c = st.columns([3, 1, 1, 1])
                 nombre = c[0].text_input("Producto").strip().upper()
-                monto = c[1].number_input("Monto $", min_value=0.0, step=1.0, value=5.0)
+                monto = c[1].number_input("Monto $", min_value=0.0, step=0.01,
+                                          format="%.2f", value=5.0)
                 fecha = c[2].date_input("Fecha", value=dt.date.today(), format="DD/MM/YYYY")
                 lote = c[3].number_input("Lote", min_value=0, step=1, value=0)
                 if st.form_submit_button("Guardar venta", type="primary"):
@@ -587,7 +588,8 @@ elif seccion == "🧾 Ventas":
             prod = disponibles[disponibles["NOMBRE"] == nombre].iloc[0]
             with st.form("venta", clear_on_submit=False):
                 c = st.columns([1, 1, 1, 1])
-                monto = c[0].number_input("Monto $", min_value=0.0, step=1.0,
+                monto = c[0].number_input("Monto $", min_value=0.0, step=0.01,
+                                          format="%.2f",
                                           value=float(prod["PRECIO_VENTA"] or 0))
                 fecha = c[1].date_input("Fecha", value=dt.date.today(), format="DD/MM/YYYY")
                 lote = c[2].number_input("Lote", min_value=0, step=1,
@@ -666,8 +668,10 @@ elif seccion == "📦 Inventario":
             nombre = c[1].text_input("Nombre corto (clave única)").strip().upper()
             c = st.columns(4)
             cant = c[0].number_input("Cantidad", min_value=1, step=1, value=1)
-            pc = c[1].number_input("Precio compra $", min_value=0.0, step=0.01, value=1.0)
-            pv = c[2].number_input("Precio venta $", min_value=0.0, step=0.5, value=5.0)
+            pc = c[1].number_input("Precio compra $", min_value=0.0, step=0.01,
+                                   format="%.2f", value=1.0)
+            pv = c[2].number_input("Precio venta $", min_value=0.0, step=0.01,
+                                   format="%.2f", value=5.0)
             lote = c[3].number_input("Lote", min_value=0, step=1,
                                      value=int(INV["LOTE"].max() or 0))
             if st.form_submit_button("Agregar", type="primary"):
@@ -799,7 +803,7 @@ elif seccion == "🎁 Por cobrar":
         with st.form("abono", clear_on_submit=True):
             c = st.columns([2, 1, 2])
             monto = c[0].number_input("Abono $", min_value=0.0, max_value=saldo,
-                                      step=1.0, value=0.0,
+                                      step=0.01, format="%.2f", value=0.0,
                                       help=f"Debe {money(saldo)}. Marca 'Saldó todo' "
                                            "si te pagó completo.")
             todo = c[1].checkbox("Saldó todo")
@@ -809,6 +813,7 @@ elif seccion == "🎁 Por cobrar":
                     st.error("El abono debe ser mayor que cero.")
                 else:
                     df = leer("ENCARGOS")
+                    df["ABONADO"] = pd.to_numeric(df["ABONADO"], errors="coerce").astype(float)
                     if destino == "TODAS":
                         resto = pago
                         for idx in cuentas.index:
@@ -848,9 +853,12 @@ elif seccion == "🎁 Por cobrar":
             with st.form("nuevo_encargo", clear_on_submit=True):
                 desc = st.text_input("Qué pidió")
                 c = st.columns(4)
-                costo = c[0].number_input("Costo $ (lo que gastaste)", min_value=0.0, step=0.5)
-                cobrar = c[1].number_input("Cobrar $", min_value=0.0, step=1.0)
-                abonado = c[2].number_input("Ya abonó $", min_value=0.0, step=1.0)
+                costo = c[0].number_input("Costo $ (lo que gastaste)", min_value=0.0,
+                                          step=0.01, format="%.2f")
+                cobrar = c[1].number_input("Cobrar $", min_value=0.0, step=0.01,
+                                           format="%.2f")
+                abonado = c[2].number_input("Ya abonó $", min_value=0.0, step=0.01,
+                                            format="%.2f")
                 fecha = c[3].date_input("Fecha", value=dt.date.today(), format="DD/MM/YYYY")
                 nota = st.text_input("Nota")
                 if st.form_submit_button("Guardar encargo", type="primary"):
@@ -870,11 +878,14 @@ elif seccion == "🎁 Por cobrar":
         else:
             with st.form("nuevo_prestamo", clear_on_submit=True):
                 c = st.columns(2)
-                prestado = c[0].number_input("Monto prestado $", min_value=0.0, step=1.0)
-                cobrar = c[1].number_input("A cobrar $", min_value=0.0, step=1.0,
+                prestado = c[0].number_input("Monto prestado $", min_value=0.0,
+                                             step=0.01, format="%.2f")
+                cobrar = c[1].number_input("A cobrar $", min_value=0.0, step=0.01,
+                                           format="%.2f",
                                            help="Igual al prestado si no cobras interés.")
                 c = st.columns([1, 1, 3])
-                abonado = c[0].number_input("Ya abonó $", min_value=0.0, step=1.0)
+                abonado = c[0].number_input("Ya abonó $", min_value=0.0, step=0.01,
+                                            format="%.2f")
                 fecha = c[1].date_input("Fecha", value=dt.date.today(), format="DD/MM/YYYY")
                 nota = c[2].text_input("Nota")
                 if st.form_submit_button("Guardar préstamo", type="primary"):
@@ -1001,7 +1012,8 @@ elif seccion == "💵 Caja Chica":
     with st.form("mov_caja", clear_on_submit=True):
         c = st.columns([1, 1, 1, 1])
         signo = c[0].radio("Tipo", ["Entrada", "Salida"], horizontal=True)
-        monto = c[1].number_input("Monto $", min_value=0.0, step=1.0, value=0.0)
+        monto = c[1].number_input("Monto $", min_value=0.0, step=0.01,
+                                  format="%.2f", value=0.0)
         mo = c[2].selectbox("Moneda", ["$", "Bs"])
         tasa = c[3].number_input("Tasa", min_value=0.0, step=0.01, value=0.0,
                                  help="Solo si la ubicación maneja bolívares.")
@@ -1018,6 +1030,8 @@ elif seccion == "💵 Caja Chica":
                              f"sacar {money(monto)}.")
                 else:
                     df = leer("CAJA")
+                    df["MONTO"] = pd.to_numeric(df["MONTO"], errors="coerce").astype(float)
+                    df["TASA"] = pd.to_numeric(df["TASA"], errors="coerce").astype(float)
                     if nombre in set(df["UBICACION"]):
                         df.loc[df["UBICACION"] == nombre, "MONTO"] = nuevo_saldo
                         df.loc[df["UBICACION"] == nombre, "MONEDA"] = mo
