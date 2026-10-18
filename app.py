@@ -21,7 +21,7 @@ st.set_page_config(page_title="Registro SHEIN", page_icon="💍", layout="wide")
 # --------------------------------------------------------------------------
 TABS = {
     "INVENTARIO": ["DESCRIPCION", "NOMBRE", "CANTIDAD", "PRECIO_COMPRA", "PRECIO_VENTA", "LOTE",
-                   "FOTO", "OCULTAR"],
+                   "FOTO", "OCULTAR", "SKU"],
     "VENTAS": ["NOMBRE", "MONTO", "FECHA", "LOTE"],
     "DEUDAS": ["DEUDOR", "MONTO", "BOLOS", "NOTA"],
     "CAJA": ["UBICACION", "MONTO", "MONEDA", "TASA"],
@@ -379,6 +379,255 @@ def hacer_respaldo():
                                                    else "")
 
 
+# --------------------------------------------------------------------------
+# Importar pedidos de SHEIN (archivo .html de "Mis pedidos" o del detalle)
+# --------------------------------------------------------------------------
+PALABRAS_VACIAS = {
+    "de", "del", "la", "el", "los", "las", "y", "con", "para", "en", "a", "un", "una", "unos",
+    "unas", "por", "al", "o", "x", "shein", "moda", "estilo", "nuevo", "nueva", "regalo",
+    "regalos", "mujer", "mujeres", "hombre", "hombres", "unisex", "pieza", "piezas", "pza",
+    "pzas", "1pc", "1pza", "conjunto", "set", "diseño", "casual", "elegante", "lujo", "aleación",
+    "zinc", "acero", "inoxidable", "simple", "minimalista", "vintage", "y2k", "trendy",
+}
+
+
+def _foto_grande(url):
+    """Miniatura de 220 px -> 600 px, suficiente para el catálogo."""
+    return re.sub(r"_thumbnail_\d+x\d*", "_thumbnail_600x", str(url or ""))
+
+
+def _clave_foto(url):
+    """Identificador de la imagen sin el sufijo de tamaño, para reconocer la misma foto."""
+    nombre = str(url or "").rsplit("/", 1)[-1]
+    return re.sub(r"_thumbnail_.*$", "", nombre.rsplit(".", 1)[0])
+
+
+def _precio_linea(g):
+    """Precio unitario si la página lo trae (la vista de detalle sí, la lista no)."""
+    for k in ("avgPrice", "unitPrice", "salePrice", "retailPrice", "goods_price", "price"):
+        v = g.get(k)
+        if isinstance(v, dict):
+            v = v.get("amount") or v.get("usdAmount")
+        n = leer_monto(v) if v not in (None, "") else None
+        if n and n > 0:
+            return n
+    return None
+
+
+def leer_pedidos_shein(contenido):
+    """Archivo .html de SHEIN -> (lista de pedidos, error).
+    Cada pedido: numero, fecha, total, envio, unidades, lineas[...]."""
+    import json
+    s = contenido.decode("utf-8", errors="ignore") if isinstance(contenido, bytes) else contenido
+    i = s.find("var gbRawData")
+    if i < 0:
+        return [], ("No encontré los datos de los pedidos en el archivo. Guárdalo desde SHEIN "
+                    "con Ctrl+S → «Página web, completa» y sube el .html.")
+    try:
+        datos, _ = json.JSONDecoder().raw_decode(s[s.find("=", i) + 1:].lstrip())
+    except ValueError:
+        return [], "El archivo está incompleto o dañado; vuelve a guardarlo desde SHEIN."
+    crudos = {}
+
+    def buscar(o):
+        if isinstance(o, dict):
+            if "billno" in o and isinstance(o.get("orderGoodsList"), list):
+                crudos.setdefault(o["billno"], o)
+            for v in o.values():
+                buscar(v)
+        elif isinstance(o, list):
+            for v in o:
+                buscar(v)
+
+    buscar(datos)
+    pedidos = []
+    for num, o in crudos.items():
+        lineas = []
+        for g in o["orderGoodsList"]:
+            cant = _ent(g.get("goods_count") or g.get("quantity") or 1) or 1   # goods_count = real
+            lineas.append({
+                "SKU": str(g.get("goods_sn") or ""),
+                "DESCRIPCION": str(g.get("goods_name") or "").strip(),
+                "ATRIBUTO": str(g.get("goods_attr") or g.get("sku_attrs_contact_str") or ""),
+                "CANTIDAD": cant,
+                "FOTO": _foto_grande(g.get("goods_img")),
+                "PRECIO_SHEIN": _precio_linea(g),
+            })
+        envio = o.get("shippingPrice")
+        envio = leer_monto(envio.get("amount")) if isinstance(envio, dict) else leer_monto(envio)
+        try:
+            fecha = dt.datetime.fromtimestamp(int(o.get("addTime")), ZONA).replace(tzinfo=None)
+        except (TypeError, ValueError):
+            fecha = None
+        pedidos.append({"numero": num, "fecha": fecha, "total": leer_monto(o.get("totalPrice")) or 0.0,
+                        "envio": envio or 0.0, "lineas": lineas,
+                        "unidades": sum(l_["CANTIDAD"] for l_ in lineas)})
+    pedidos.sort(key=lambda p_: p_["fecha"] or dt.datetime.min, reverse=True)
+    if not pedidos:
+        return [], "El archivo no trae pedidos. ¿Guardaste la página de «Mis pedidos»?"
+    return pedidos, None
+
+
+# sustantivo en la descripción de SHEIN -> (tipo en tu vocabulario, costo típico en SHEIN)
+SUSTANTIVOS = {
+    "collar": ("COLLAR", 2.0), "gargantilla": ("COLLAR", 2.0), "cadena": ("CADENA", 2.5),
+    "pulsera": ("PULSERA", 1.5), "brazalete": ("BRAZALETE", 2.0), "tobillera": ("PULSERA", 1.5),
+    "anillo": ("ANILLO", 1.2), "sortija": ("ANILLO", 1.2),
+    "pendiente": ("ZARCILLO", 1.5), "arete": ("ZARCILLO", 1.5), "zarcillo": ("ZARCILLO", 1.5),
+    "piercing": ("ZARCILLO", 1.5),
+    "llavero": ("LLAVERO", 2.0), "colgante": ("COLGANTE", 2.0), "dije": ("DIJE", 1.5),
+    "broche": ("BROCHE", 1.5), "pinza": ("PINZA", 1.0), "diadema": ("DIADEMA", 1.5),
+    "reloj": ("RELOJ", 8.0), "bolso": ("BOLSO", 6.0), "bolsa": ("BOLSO", 6.0),
+    "cartera": ("CARTERA", 5.0), "mochila": ("MOCHILA", 9.0), "gafas": ("LENTES", 3.0),
+    "lentes": ("LENTES", 3.0), "gorra": ("GORRA", 4.0), "gorro": ("GORRO", 4.0),
+    "sombrero": ("SOMBRERO", 5.0), "cinturon": ("CINTURON", 3.0), "bufanda": ("BUFANDA", 4.0),
+    "camisa": ("CAMISA", 7.0), "camiseta": ("CAMISA", 5.0), "blusa": ("BLUSA", 6.0),
+    "top": ("TOP", 5.0), "sudadera": ("SUDADERA", 10.0), "sueter": ("SUETER", 9.0),
+    "jersey": ("SUETER", 9.0), "cardigan": ("SUETER", 9.0), "chaqueta": ("CHAQUETA", 14.0),
+    "abrigo": ("CHAQUETA", 15.0), "chaleco": ("CHALECO", 8.0), "pantalon": ("PANTALON", 10.0),
+    "jeans": ("PANTALON", 12.0), "vaqueros": ("PANTALON", 12.0), "vaquero": ("PANTALON", 12.0),
+    "short": ("SHORT", 7.0), "shorts": ("SHORT", 7.0), "falda": ("FALDA", 7.0),
+    "vestido": ("VESTIDO", 9.0), "mono": ("MONO", 10.0), "pijama": ("PIJAMA", 9.0),
+    "lenceria": ("LENCERIA", 6.0), "bikini": ("TRAJE DE BAÑO", 8.0), "calcetines": ("MEDIAS", 2.0),
+    "medias": ("MEDIAS", 2.0), "zapatos": ("ZAPATOS", 12.0), "zapatillas": ("ZAPATOS", 12.0),
+    "tenis": ("ZAPATOS", 12.0), "sandalias": ("SANDALIAS", 8.0), "botas": ("BOTAS", 15.0),
+    "perro": ("ROPA MASCOTA", 5.0), "perros": ("ROPA MASCOTA", 5.0), "mascota": ("ROPA MASCOTA", 5.0),
+    "outfit": ("CONJUNTO", 12.0),
+}
+
+
+def _norm(w):
+    import unicodedata
+    w = unicodedata.normalize("NFD", str(w).lower())
+    return "".join(c for c in w if unicodedata.category(c) != "Mn")
+
+
+def tipo_de(palabra):
+    """Palabra -> tipo de tu vocabulario (PENDIENTES -> ZARCILLO), o None."""
+    w = _norm(palabra)
+    for cand in (w, w[:-1] if w.endswith("s") else w, w[:-2] if w.endswith("es") else w):
+        if cand in SUSTANTIVOS:
+            return SUSTANTIVOS[cand][0]
+    return None
+
+
+def _tipo(palabra):
+    """Para tus nombres: primera palabra -> tipo (ZARCILLOS -> ZARCILLO, COLLARES -> COLLAR)."""
+    return tipo_de(palabra) or str(palabra).upper()
+
+
+def costos_por_tipo(inv):
+    """Tu costo mediano por tipo de producto (con al menos 2 productos de muestra)."""
+    df = pd.DataFrame({"TIPO": inv["NOMBRE"].astype(str).str.split().str[0].map(_tipo),
+                       "COSTO": pd.to_numeric(inv["PRECIO_COMPRA"], errors="coerce")}).dropna()
+    df = df[df["COSTO"] > 0]
+    tabla = df.groupby("TIPO")["COSTO"].agg(["median", "size"])
+    return tabla[tabla["size"] >= 2]["median"].to_dict(), (df["COSTO"].median() if len(df) else 1.0)
+
+
+def _sustantivo(desc):
+    """Primer sustantivo de producto en la descripción y su posición."""
+    palabras = re.findall(r"[A-Za-zÁÉÍÓÚÑÜáéíóúñü]+", str(desc))
+    for i, w in enumerate(palabras):
+        if tipo_de(w):
+            return i, w, palabras
+    return None, None, palabras
+
+
+def costear(pedido, inv=None):
+    """Reparte lo que pagaste por los productos (total menos envío) entre sus unidades:
+    - si la página trae el precio de cada producto, en proporción a ese precio (exacto);
+    - si no, en proporción a lo que suele costar ese tipo: tu historia si la hay, si no un
+      costo típico de SHEIN (estimado). La suma siempre da exactamente lo pagado."""
+    pagado = max(pedido["total"] - pedido["envio"], 0.0)
+    lineas = pedido["lineas"]
+    exacto = all(l_["PRECIO_SHEIN"] for l_ in lineas)
+    tuyos, mediana = costos_por_tipo(inv) if (inv is not None and len(inv)) else ({}, 2.0)
+    for l_ in lineas:
+        if exacto:
+            l_["PESO"] = l_["PRECIO_SHEIN"]
+            continue
+        _, w, _p = _sustantivo(l_["DESCRIPCION"])
+        tipo = tipo_de(w) if w else None
+        if tipo in tuyos:
+            l_["PESO"] = tuyos[tipo]
+        elif w:
+            l_["PESO"] = SUSTANTIVOS.get(_norm(w), SUSTANTIVOS.get(_norm(w)[:-1],
+                         SUSTANTIVOS.get(_norm(w)[:-2], (None, mediana))))[1]
+        else:
+            l_["PESO"] = mediana
+    base = sum(l_["PESO"] * l_["CANTIDAD"] for l_ in lineas)
+    for l_ in lineas:
+        l_["COSTO"] = round(pagado * l_["PESO"] / base, 4) if base else 0.0
+        l_["COSTO_REAL"] = exacto
+    return lineas
+
+
+def nombre_corto(desc, atributo=""):
+    """Nombre sugerido desde el tipo de producto (la marca del vendedor queda fuera);
+    las licencias (HARRY POTTER X SHEIN) se agregan al final."""
+    desc = str(desc)
+    licencia = ""
+    m = re.match(r"^(.*?)\s+X\s+SHEIN\b\s*(.*)$", desc, re.I)
+    if m:
+        licencia, desc = m.group(1).strip().upper(), m.group(2)
+    i, w, palabras = _sustantivo(desc)
+    if i is None:               # sin sustantivo conocido: saltar marca en mayúsculas al inicio
+        tokens = desc.split()
+        while len(tokens) > 2 and re.fullmatch(r"[A-Z0-9&\-]{2,}", tokens[0]):
+            tokens.pop(0)
+        palabras, i = re.findall(r"[A-Za-zÁÉÍÓÚÑÜáéíóúñü]+", " ".join(tokens)), 0
+    utiles = [x.upper() for x in palabras[i:] if _norm(x) not in PALABRAS_VACIAS and len(x) > 2]
+    partes = utiles[:3] if not licencia else utiles[:2] + licencia.split()[:2]
+    nombre = " ".join(partes) or "PRODUCTO"
+    color = str(atributo).split("/")[0].strip().upper()
+    if color and color not in nombre and _norm(color) not in ("multicolor", "unitalla") \
+            and not _norm(color).startswith(("estilo", "talla", "tamano", "modelo")) \
+            and not re.search(r"\d", color) and len(nombre) + len(color) < 34:
+        nombre += f" {color}"
+    return nombre
+
+
+def precio_sugerido(costo, mult, escalera):
+    objetivo = costo * mult
+    for v in escalera:
+        if v >= objetivo - 0.001:
+            return float(v)
+    return float(5 * -(-objetivo // 5))          # por encima de la escalera: múltiplo de 5
+
+
+def emparejar(lineas, inv, umbral=0.85):
+    """Marca qué productos ya están en el inventario: por código SKU, por foto o por
+    descripción parecida. Cada producto del inventario se empareja con uno solo del pedido
+    (el más parecido), para que dos artículos de la misma línea no se confundan."""
+    import difflib
+    skus = {str(s): n for s, n in zip(inv["SKU"], inv["NOMBRE"]) if str(s).strip()}
+    fotos = {_clave_foto(f): n for f, n in zip(inv["FOTO"], inv["NOMBRE"])
+             if str(f).startswith("http")}
+    descs = [(str(d).lower().strip(), n) for d, n in zip(inv["DESCRIPCION"], inv["NOMBRE"])
+             if len(str(d).strip()) > 8]
+    candidatos = []                      # (parecido, indice de la línea, nombre en inventario)
+    for i, l_ in enumerate(lineas):
+        l_["COINCIDE"], l_["COMO"] = None, ""
+        if l_["SKU"] in skus:
+            l_["COINCIDE"], l_["COMO"] = skus[l_["SKU"]], "código"
+        elif _clave_foto(l_["FOTO"]) in fotos:
+            l_["COINCIDE"], l_["COMO"] = fotos[_clave_foto(l_["FOTO"])], "foto"
+        else:
+            d = l_["DESCRIPCION"].lower()
+            for dd, n in descs:
+                r = difflib.SequenceMatcher(None, d, dd).ratio()
+                if r >= umbral:
+                    candidatos.append((r, i, n))
+    tomados = {l_["COINCIDE"] for l_ in lineas if l_["COINCIDE"]}
+    for r, i, n in sorted(candidatos, reverse=True):          # el más parecido gana
+        if lineas[i]["COINCIDE"] or n in tomados:
+            continue
+        lineas[i]["COINCIDE"], lineas[i]["COMO"] = n, f"descripción {r:.0%}"
+        tomados.add(n)
+    return lineas
+
+
 def set_lote(lote, estado, llegada=None):
     """Marca un lote como EN CAMINO o RECIBIDO (con su fecha de llegada)."""
     df = leer("LOTES")
@@ -654,7 +903,8 @@ def aplicar_caja(ubic, delta, origen="", detalle=""):
     df["MONTO"] = pd.to_numeric(df["MONTO"], errors="coerce").fillna(0).astype(float)
     mascara = df["UBICACION"] == ubic
     mon_u = moneda_norm(df.loc[mascara, "MONEDA"]).iloc[0] if mascara.any() else "$"
-    df.loc[mascara, "MONTO"] = df.loc[mascara, "MONTO"] + delta
+    delta = round(delta, 2)
+    df.loc[mascara, "MONTO"] = (df.loc[mascara, "MONTO"] + delta).round(2)
     guardar("CAJA", df)
     registrar_mov(ubic, delta, mon_u, _num(df.loc[mascara, "MONTO"].sum()), origen, detalle)
     st.session_state["ult_caja"] = ubic
@@ -665,8 +915,8 @@ def aplicar_caja(ubic, delta, origen="", detalle=""):
 def registrar_mov(ubic, delta, moneda, saldo, origen, detalle=""):
     try:
         anexar("MOVIMIENTOS", [{"FECHA": pd.Timestamp(ahora()).floor("min"),
-                                "UBICACION": ubic, "MONTO": delta, "MONEDA": moneda,
-                                "SALDO": saldo, "ORIGEN": origen or "Otro",
+                                "UBICACION": ubic, "MONTO": round(delta, 2), "MONEDA": moneda,
+                                "SALDO": round(saldo, 2), "ORIGEN": origen or "Otro",
                                 "DETALLE": detalle}])
     except Exception as e:      # la bitácora nunca debe tumbar el guardado principal
         st.session_state["aviso_bitacora"] = f"No se pudo anotar en la bitácora: {e}"
@@ -1218,6 +1468,200 @@ elif seccion == "🧾 Ventas":
 # --------------------------------------------------------------------------
 elif seccion == "📦 Inventario":
     st.header("Inventario")
+
+    with st.expander("📥 Importar pedido SHEIN"):
+        st.caption("En SHEIN abre **Mis pedidos**, baja hasta que carguen todos, y guarda con "
+                   "Ctrl+S → «Página web, completa». Sube aquí solo el archivo .html.")
+        archivo = st.file_uploader("Archivo de SHEIN", type=["html", "htm"], key="up_shein",
+                                   label_visibility="collapsed")
+        if archivo is not None:
+            peds, err = leer_pedidos_shein(archivo.getvalue())
+            if err:
+                st.error(err)
+            else:
+                skus_inv = {str(s_) for s_ in INV["SKU"] if str(s_).strip()}
+                etiquetas, por_defecto = {}, []
+                fecha_reciente = peds[0]["fecha"].date() if peds[0]["fecha"] else None
+                for p_ in peds:
+                    ya = sum(1 for l_ in p_["lineas"] if l_["SKU"] in skus_inv)
+                    marca = (" · ✅ ya importado" if ya == len(p_["lineas"])
+                             else (f" · {ya} ya importados" if ya else ""))
+                    f_ = f"{p_['fecha']:%d/%m/%Y}" if p_["fecha"] else "sin fecha"
+                    et = (f"{f_} · {p_['numero']} · {p_['unidades']} u. · {money(p_['total'])}"
+                          + marca)
+                    etiquetas[et] = p_
+                    if p_["fecha"] and p_["fecha"].date() == fecha_reciente and ya < len(p_["lineas"]):
+                        por_defecto.append(et)
+                elegidos = st.multiselect("Pedidos que forman este lote", list(etiquetas),
+                                          default=por_defecto,
+                                          help="Vienen marcados los del día más reciente que "
+                                               "todavía no importaste.")
+                if elegidos:
+                    pedidos_sel = [etiquetas[e_] for e_ in elegidos]
+                    ratios = (pd.to_numeric(INV["PRECIO_VENTA"], errors="coerce") /
+                              pd.to_numeric(INV["PRECIO_COMPRA"], errors="coerce"))
+                    ratios = ratios.replace([float("inf")], float("nan")).dropna()
+                    mult_def = round(float(ratios.median()), 1) if len(ratios) else 2.5
+                    c = st.columns([1, 3])
+                    mult = c[0].number_input("Precio de venta = costo ×", min_value=1.0,
+                                             max_value=10.0, value=mult_def, step=0.1,
+                                             help="Por defecto, tu margen habitual.")
+                    c[1].caption(f"Tu margen habitual es ×{mult_def}. El precio se redondea "
+                                 "hacia arriba a los precios que sueles usar (5, 6, 8, 10…).")
+                    escalera = sorted(set(pd.to_numeric(INV["PRECIO_VENTA"], errors="coerce")
+                                          .dropna()) |
+                                      {3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 15, 18, 20, 25, 30, 35, 40,
+                                       45, 50, 60, 70, 80, 100})
+                    lineas, exacto, envio_total, pagado_total = [], True, 0.0, 0.0
+                    for p_ in pedidos_sel:
+                        ls = costear({**p_, "lineas": [dict(l_) for l_ in p_["lineas"]]}, inv_raw)
+                        exacto = exacto and all(l_["COSTO_REAL"] for l_ in ls)
+                        envio_total += p_["envio"]
+                        pagado_total += p_["total"]
+                        for l_ in ls:
+                            l_["PEDIDO"] = p_["numero"]
+                        lineas.extend(ls)
+                    emparejar(lineas, INV)
+                    usados = set(INV["NOMBRE"])
+                    filas_imp = []
+                    for l_ in lineas:
+                        nom = l_["COINCIDE"] or nombre_corto(l_["DESCRIPCION"], l_["ATRIBUTO"])
+                        if not l_["COINCIDE"]:
+                            base_n, k_ = nom, 2
+                            while nom in usados:
+                                nom, k_ = f"{base_n} {k_}", k_ + 1
+                            usados.add(nom)
+                        filas_imp.append({
+                            "IMPORTAR": not bool(l_["COINCIDE"]),
+                            "FOTO": l_["FOTO"],
+                            "NOMBRE": nom,
+                            "CANTIDAD": int(l_["CANTIDAD"]),
+                            "COSTO": round(l_["COSTO"], 2),
+                            "PRECIO_VENTA": precio_sugerido(l_["COSTO"], mult, escalera),
+                            "ESTADO": (f"✅ ya está como {l_['COINCIDE']} ({l_['COMO']})"
+                                       if l_["COINCIDE"] else "🆕 nuevo"),
+                            "DESCRIPCION": l_["DESCRIPCION"],
+                            "ATRIBUTO": l_["ATRIBUTO"],
+                            "SKU": l_["SKU"],
+                            "COINCIDE_INV": l_["COINCIDE"] or "",
+                        })
+                    tabla = pd.DataFrame(filas_imp)
+                    n_ya = int((tabla["COINCIDE_INV"] != "").sum())
+                    st.caption(
+                        f"{len(tabla)} productos, {int(tabla['CANTIDAD'].sum())} unidades"
+                        + (f" · {n_ya} ya están en tu inventario y vienen desmarcados" if n_ya
+                           else "")
+                        + ". " + ("Costos exactos según el precio de cada producto." if exacto
+                                  else "La página no trae el precio de cada producto: el costo "
+                                       "se estimó según lo que te suele costar cada tipo, y la "
+                                       "suma da exactamente lo que pagaste. Corrígelo donde "
+                                       "sepas el precio real."))
+                    clave_ed = "ed_imp_" + "_".join(sorted(p_["numero"] for p_ in pedidos_sel)) \
+                               + f"_{mult}"
+                    ed_imp = st.data_editor(
+                        tabla, key=clave_ed, hide_index=True, width="stretch", height=430,
+                        column_order=["IMPORTAR", "FOTO", "NOMBRE", "CANTIDAD", "COSTO",
+                                      "PRECIO_VENTA", "ESTADO", "DESCRIPCION", "ATRIBUTO"],
+                        disabled=["FOTO", "ESTADO", "DESCRIPCION", "ATRIBUTO"],
+                        column_config={
+                            "IMPORTAR": st.column_config.CheckboxColumn("✔", width="small"),
+                            "FOTO": st.column_config.ImageColumn("Foto", width="small"),
+                            "NOMBRE": st.column_config.TextColumn("Nombre corto", width="medium"),
+                            "CANTIDAD": st.column_config.NumberColumn("Cant.", min_value=1,
+                                                                      step=1, format="%d"),
+                            "COSTO": st.column_config.NumberColumn("Costo c/u", format="$%.2f",
+                                                                   min_value=0.0),
+                            "PRECIO_VENTA": st.column_config.NumberColumn("Venta",
+                                                                          format="$%.2f",
+                                                                          min_value=0.0),
+                            "ESTADO": st.column_config.TextColumn("Estado", width="medium"),
+                            "DESCRIPCION": st.column_config.TextColumn("Descripción SHEIN"),
+                        })
+                    sel = ed_imp[ed_imp["IMPORTAR"]]
+                    costo_sel = float((sel["COSTO"] * sel["CANTIDAD"]).sum())
+                    st.caption("Si marcas uno que ya está, su cantidad **se suma** a ese producto "
+                               "en vez de crear uno nuevo; cambia «Cant.» para sumar solo las que "
+                               "faltan.")
+
+                    st.markdown(f"**A importar:** {len(sel)} productos · "
+                                f"{int(sel['CANTIDAD'].sum())} unidades · costo {money(costo_sel)}")
+                    c = st.columns([1, 1, 2])
+                    lote_imp = c[0].number_input(
+                        "Lote", min_value=1, step=1,
+                        value=_ent(INV["LOTE"].max() if len(INV) else 0) + 1, key="lote_imp")
+                    no_llego = c[1].checkbox("Todavía no ha llegado", value=True,
+                                             key="imp_en_camino")
+                    ubic_imp = selector_caja(c[2], "¿De dónde salió el pago?", "caja_imp",
+                                             mover_por_defecto=False)
+                    envio_gasto = False
+                    if envio_total > 0:
+                        envio_gasto = st.checkbox(
+                            f"Registrar el envío de {money(envio_total)} en Gastos (lote "
+                            f"{lote_imp})", value=True, key="imp_envio")
+                    if st.button(f"📥 Importar {len(sel)} productos", type="primary",
+                                 disabled=sel.empty, key="btn_importar"):
+                        nuevos = sel[sel["COINCIDE_INV"] == ""]
+                        sumar = sel[sel["COINCIDE_INV"] != ""]
+                        nombres = nuevos["NOMBRE"].astype(str).str.strip().str.upper()
+                        repetidos = sorted(set(nombres[nombres.duplicated()]) |
+                                           (set(nombres) & set(INV["NOMBRE"])))
+                        sale = costo_sel + (envio_total if envio_gasto else 0.0)
+                        delta, _, err = plan_caja(ubic_imp, -sale)
+                        if (nombres == "").any():
+                            st.error("Hay productos sin nombre corto.")
+                        elif repetidos:
+                            st.error("Estos nombres ya existen o se repiten: "
+                                     + ", ".join(repetidos[:8]) + ". Cámbialos para que cada "
+                                     "producto lleve su propio contador de ventas.")
+                        elif err:
+                            st.error(err)
+                        else:
+                            df_inv = leer("INVENTARIO")
+                            df_inv["CANTIDAD"] = pd.to_numeric(df_inv["CANTIDAD"],
+                                                               errors="coerce").fillna(0)
+                            # los que dejaste desmarcados como "ya está" son el mismo producto:
+                            # se les guarda el código y la foto para reconocerlos la próxima vez
+                            for r_ in ed_imp[(~ed_imp["IMPORTAR"]) &
+                                             (ed_imp["COINCIDE_INV"] != "")].itertuples():
+                                m_ = df_inv["NOMBRE"] == r_.COINCIDE_INV
+                                if m_.any() and not str(df_inv.loc[m_, "SKU"].iloc[0]).strip():
+                                    df_inv.loc[m_, "SKU"] = r_.SKU
+                                if m_.any() and not str(df_inv.loc[m_, "FOTO"].iloc[0]) \
+                                        .startswith("http"):
+                                    df_inv.loc[m_, "FOTO"] = r_.FOTO
+                            for r_ in sumar.itertuples():
+                                m_ = df_inv["NOMBRE"] == r_.COINCIDE_INV
+                                df_inv.loc[m_, "CANTIDAD"] += int(r_.CANTIDAD)
+                                if not str(df_inv.loc[m_, "SKU"].iloc[0]).strip():
+                                    df_inv.loc[m_, "SKU"] = r_.SKU
+                                if not str(df_inv.loc[m_, "FOTO"].iloc[0]).startswith("http"):
+                                    df_inv.loc[m_, "FOTO"] = r_.FOTO
+                            filas_n = [{
+                                "DESCRIPCION": f"{r_.DESCRIPCION}"
+                                               + (f" ({r_.ATRIBUTO})" if r_.ATRIBUTO else ""),
+                                "NOMBRE": str(r_.NOMBRE).strip().upper(),
+                                "CANTIDAD": int(r_.CANTIDAD), "PRECIO_COMPRA": float(r_.COSTO),
+                                "PRECIO_VENTA": float(r_.PRECIO_VENTA), "LOTE": int(lote_imp),
+                                "FOTO": r_.FOTO, "OCULTAR": "", "SKU": r_.SKU,
+                            } for r_ in nuevos.itertuples()]
+                            guardar("INVENTARIO", pd.concat([df_inv, pd.DataFrame(filas_n)],
+                                                            ignore_index=True))
+                            if no_llego and int(lote_imp) not in EN_CAMINO:
+                                set_lote(int(lote_imp), "EN CAMINO")
+                            if envio_gasto:
+                                agregar("GASTOS", {
+                                    "FECHA": pd.Timestamp(hoy()), "CATEGORIA": "ENVÍO",
+                                    "CONCEPTO": "envío pedido SHEIN", "LOTE": int(lote_imp),
+                                    "MONTO": envio_total, "MONEDA": "$",
+                                    "UBICACION": ubic_imp or ""})
+                            extra = aplicar_caja(ubic_imp, delta, "Compra",
+                                                 f"pedido SHEIN lote {int(lote_imp)}")
+                            avisar(f"Importados {len(filas_n)} productos nuevos"
+                                   + (f" y sumadas unidades a {len(sumar)} existentes"
+                                      if len(sumar) else "")
+                                   + f" en el lote {int(lote_imp)}"
+                                   + (" (en camino)" if no_llego else "") + "." + extra)
+                            st.rerun()
 
     with st.expander("➕ Agregar producto"):
         with st.form("nuevo_prod", clear_on_submit=True):
