@@ -31,6 +31,7 @@ TABS = {
     "GASTOS": ["FECHA", "CATEGORIA", "CONCEPTO", "LOTE", "MONTO", "MONEDA", "UBICACION"],
     "MOVIMIENTOS": ["FECHA", "UBICACION", "MONTO", "MONEDA", "SALDO", "ORIGEN", "DETALLE"],
     "CONTACTOS": ["PERSONA", "TELEFONO"],
+    "LOTES": ["LOTE", "ESTADO", "LLEGADA"],
     "VENTAS_HIST": ["NOMBRE", "MONTO", "FECHA", "LOTE"],
     "INVENTARIO_HIST": ["NOMBRE", "SKU", "PROPIETARIO", "TALLA", "CANTIDAD", "PRECIO_COMPRA",
                         "PRECIO_VENTA", "TIPO", "CATEGORIA", "LOTE", "FECHA_LOTE"],
@@ -48,6 +49,7 @@ NUMERICAS = {
     "ENCARGOS": ["COSTO", "COBRAR", "ABONADO"],
     "GASTOS": ["MONTO", "LOTE"],
     "MOVIMIENTOS": ["MONTO", "SALDO"],
+    "LOTES": ["LOTE"],
     "VENTAS_HIST": ["MONTO", "LOTE"],
     "INVENTARIO_HIST": ["CANTIDAD", "PRECIO_COMPRA", "PRECIO_VENTA", "LOTE"],
 }
@@ -55,11 +57,11 @@ NUMERICAS = {
 DINERO = {"MONTO", "PRECIO_COMPRA", "PRECIO_VENTA", "BOLOS", "TASA", "COSTO", "COBRAR",
           "ABONADO", "SALDO"}
 FECHAS = {"VENTAS": ["FECHA"], "ENCARGOS": ["FECHA", "ULT_ABONO"], "GASTOS": ["FECHA"],
-          "MOVIMIENTOS": ["FECHA"], "VENTAS_HIST": ["FECHA"],
+          "MOVIMIENTOS": ["FECHA"], "LOTES": ["LLEGADA"], "VENTAS_HIST": ["FECHA"],
           "INVENTARIO_HIST": ["FECHA_LOTE"]}
 CLAVES = {"INVENTARIO": "NOMBRE", "VENTAS": "NOMBRE", "DEUDAS": "DEUDOR", "CAJA": "UBICACION",
           "ENCARGOS": "PERSONA", "CONFIG": "CLAVE", "GASTOS": "CATEGORIA",
-          "MOVIMIENTOS": "UBICACION", "CONTACTOS": "PERSONA",
+          "MOVIMIENTOS": "UBICACION", "CONTACTOS": "PERSONA", "LOTES": "LOTE",
           "VENTAS_HIST": "NOMBRE",
           "INVENTARIO_HIST": "NOMBRE"}
 SCOPES = [
@@ -326,7 +328,7 @@ def tasa_usdt():
         return None
 
 
-RESPALDO_TABS = ["INVENTARIO", "VENTAS", "ENCARGOS", "CAJA", "GASTOS", "MOVIMIENTOS",
+RESPALDO_TABS = ["INVENTARIO", "VENTAS", "ENCARGOS", "CAJA", "GASTOS", "MOVIMIENTOS", "LOTES",
                  "CONTACTOS", "CONFIG"]
 RESPALDO_DIAS = 30
 
@@ -375,6 +377,16 @@ def hacer_respaldo():
     total = sum(len(leer(t_)) for t_ in RESPALDO_TABS)
     return f"Respaldo {nombre}: {total} filas" + (f", {borradas} antiguos borrados" if borradas
                                                    else "")
+
+
+def set_lote(lote, estado, llegada=None):
+    """Marca un lote como EN CAMINO o RECIBIDO (con su fecha de llegada)."""
+    df = leer("LOTES")
+    df = df[pd.to_numeric(df["LOTE"], errors="coerce") != float(lote)]
+    fila = {"LOTE": float(lote), "ESTADO": estado,
+            "LLEGADA": pd.Timestamp(llegada) if llegada else None}
+    df = pd.concat([df, pd.DataFrame([fila])], ignore_index=True).sort_values("LOTE")
+    guardar("LOTES", df)
 
 
 def set_config(**valores):
@@ -702,7 +714,13 @@ if (BACKEND == "gsheets" and secreto("backup_spreadsheet_id")
     except Exception as e:
         st.session_state["respaldo_error"] = f"{type(e).__name__}: {e}"
 
+LOTES = leer("LOTES")
+EN_CAMINO = set(pd.to_numeric(
+    LOTES.loc[LOTES["ESTADO"].astype(str).str.upper() == "EN CAMINO", "LOTE"],
+    errors="coerce").dropna())
+LLEGADAS = dict(zip(pd.to_numeric(LOTES["LOTE"], errors="coerce"), LOTES["LLEGADA"]))
 INV = inventario_calculado(inv_raw, ven_raw)
+INV["EN_CAMINO"] = INV["LOTE"].isin(EN_CAMINO)
 VEN = ventas_calculadas(ven_raw, inv_raw)
 ENC = encargos_calculados(enc, TASA)
 CAJA = caja_calculada(caja, TASA)
@@ -1081,7 +1099,8 @@ elif seccion == "🧾 Ventas":
             st.warning("No hay productos con existencia. Carga inventario o usa producto libre.")
         else:
             etiquetas = {
-                f"{r.NOMBRE}  ·  stock {_ent(r.EXISTENCIA)}  ·  {money(r.PRECIO_VENTA)}": r.NOMBRE
+                f"{r.NOMBRE}  ·  stock {_ent(r.EXISTENCIA)}  ·  {money(r.PRECIO_VENTA)}"
+                + ("  ·  🚚 en camino" if r.EN_CAMINO else ""): r.NOMBRE
                 for r in disponibles.itertuples()
             }
             sel = st.selectbox("Producto", list(etiquetas.keys()))
@@ -1213,6 +1232,9 @@ elif seccion == "📦 Inventario":
                                      value=_ent(INV["LOTE"].max() if len(INV) else 0))
             foto = st.text_input("Foto (enlace, opcional)", placeholder="https://…",
                                  help="Sale en el catálogo para clientes.")
+            no_llega = st.checkbox("Este lote todavía no ha llegado",
+                                   help="Sus productos no salen en el catálogo hasta que "
+                                        "marques el lote como recibido.")
             ubic = selector_caja(st, "¿De dónde salió el pago?", "caja_nuevo_prod",
                                  mover_por_defecto=False)
             st.caption("Elige la ubicación si estás registrando una compra nueva. "
@@ -1234,6 +1256,8 @@ elif seccion == "📦 Inventario":
                         "PRECIO_COMPRA": pc, "PRECIO_VENTA": pv, "LOTE": lote,
                         "FOTO": foto.strip(),
                     })
+                    if no_llega and lote and lote not in EN_CAMINO:
+                        set_lote(lote, "EN CAMINO")
                     extra = aplicar_caja(ubic, delta, "Compra", f"{nombre} x{int(cant)}")
                     avisar(f"{nombre} agregado.{extra}")
                     st.rerun()
@@ -1241,7 +1265,7 @@ elif seccion == "📦 Inventario":
     c1, c2, c3 = st.columns([2, 1, 1])
     busq = c1.text_input("Buscar").strip().upper()
     f_lote = c2.multiselect("Lote", sorted(int(x) for x in INV["LOTE"].dropna().unique()))
-    estado = c3.selectbox("Estado", ["Todos", "Con existencia", "Agotados"])
+    estado = c3.selectbox("Estado", ["Todos", "Con existencia", "Agotados", "En camino"])
 
     i = INV.copy()
     if busq:
@@ -1252,6 +1276,8 @@ elif seccion == "📦 Inventario":
         i = i[i["EXISTENCIA"] > 0]
     elif estado == "Agotados":
         i = i[i["EXISTENCIA"] <= 0]
+    elif estado == "En camino":
+        i = i[i["EN_CAMINO"]]
 
     k = st.columns(4)
     k[0].metric("Productos", len(i))
@@ -1275,15 +1301,44 @@ elif seccion == "📦 Inventario":
         },
     )
 
+    with st.expander(f"🚚 Lotes en camino ({len(EN_CAMINO)})", expanded=bool(EN_CAMINO)):
+        st.caption("Los productos de un lote en camino no salen en el catálogo. Cuando llegue, "
+                   "márcalo como recibido y aparecen solos.")
+        if EN_CAMINO:
+            filas_ec = []
+            for l_ in sorted(EN_CAMINO):
+                prod_l = INV[INV["LOTE"] == l_]
+                filas_ec.append({"LOTE": int(l_), "PRODUCTOS": len(prod_l),
+                                 "UNIDADES": int(prod_l["CANTIDAD"].sum()),
+                                 "MERCANCÍA": prod_l["INVERSION"].sum()})
+            st.dataframe(pd.DataFrame(filas_ec), width="stretch", hide_index=True,
+                         column_config={"MERCANCÍA": st.column_config.NumberColumn(
+                             format="$%.2f")})
+        lotes_inv = sorted({int(x) for x in INV["LOTE"].dropna()}, reverse=True)
+        with st.form("form_lote", border=False):
+            c = st.columns([1, 2, 1])
+            l_sel = c[0].selectbox("Lote", lotes_inv) if lotes_inv else None
+            accion = c[1].radio("Estado", ["Llegó", "En camino"], horizontal=True)
+            llegada = c[2].date_input("Fecha de llegada", value=hoy(), format="DD/MM/YYYY")
+            if st.form_submit_button("Guardar estado del lote") and l_sel is not None:
+                if accion == "Llegó":
+                    set_lote(l_sel, "RECIBIDO", llegada)
+                    avisar(f"Lote {l_sel} recibido el {llegada:%d/%m/%Y}: ya sale en el "
+                           "catálogo.")
+                else:
+                    set_lote(l_sel, "EN CAMINO")
+                    avisar(f"Lote {l_sel} en camino: sus productos no salen en el catálogo.")
+                st.rerun()
+
     with st.expander("🛍️ Catálogo para clientes"):
         url_cat = str(_cfg.get("CATALOGO_URL") or "")
         if url_cat:
             st.markdown(f"Tu catálogo: [{url_cat}]({url_cat})")
         visibles = INV[(INV["EXISTENCIA"] > 0) & (INV["PRECIO_VENTA"] > 0) &
-                       (INV["OCULTAR"].astype(str).str.upper() != "SI")]
+                       (INV["OCULTAR"].astype(str).str.upper() != "SI") & (~INV["EN_CAMINO"])]
         con_foto = visibles["FOTO"].astype(str).str.startswith("http").sum()
-        st.caption(f"Se ven {len(visibles)} productos (los que tienen existencia y no están "
-                   f"ocultos); {con_foto} con foto. Para agregar fotos u ocultar algo, usa las "
+        st.caption(f"Se ven {len(visibles)} productos (con existencia, no ocultos y de lotes "
+                   f"que ya llegaron); {con_foto} con foto. Para agregar fotos u ocultar algo, usa las "
                    "columnas FOTO y OCULTAR en «✏️ Editar inventario».")
         with st.form("cfg_catalogo", border=False):
             c = st.columns(2)
@@ -1912,8 +1967,12 @@ elif seccion == "📈 Rotación":
         lt["NETA"] = lt["BRUTA"].fillna(0) - lt["GASTOS"]
         lt["VENDIDO_PCT"] = lt["VENDIDAS"] / lt["COMPRADAS"] * 100
         completo = lt["VENDIDAS"] >= lt["COMPRADAS"]
-        lt["DIAS"] = ((lt["ULTIMA"].where(completo, hoy_ts) - lt["PRIMERA"]).dt.days)
+        lt["LLEGADA"] = pd.to_datetime(lt["LOTE"].map(LLEGADAS), errors="coerce")
+        inicio = lt["LLEGADA"].where(lt["LLEGADA"].notna(), lt["PRIMERA"])
+        lt["DIAS"] = ((lt["ULTIMA"].where(completo, hoy_ts) - inicio).dt.days)
         lt["ESTADO"] = completo.map({True: "✅ vendido", False: "⏳ en venta"})
+        lt.loc[lt["LOTE"].isin(EN_CAMINO), "ESTADO"] = "🚚 en camino"
+        lt.loc[lt["LOTE"].isin(EN_CAMINO), "DIAS"] = float("nan")
         lt["LOTE"] = lt["LOTE"].astype(int)
         lt = lt.sort_values("LOTE", ascending=False)
         st.dataframe(
@@ -1932,12 +1991,12 @@ elif seccion == "📈 Rotación":
                 "NETA": st.column_config.NumberColumn("Ganancia neta", format="$%.2f"),
             })
         st.caption("Ganancia neta = lo vendido menos lo que costó esa mercancía, menos los "
-                   "gastos asignados al lote (envíos y otros). Los días cuentan desde la "
-                   "primera venta porque no se registra la fecha de llegada del lote.")
+                   "gastos asignados al lote (envíos y otros). Los días cuentan desde que el "
+                   "lote llegó; si no marcaste la llegada, desde su primera venta.")
 
     with t4:
         lim = st.slider("Sin vender hace más de (días)", 15, 180, 60, step=15)
-        est = pr[(pr["EXISTENCIA"] > 0) &
+        est = pr[(pr["EXISTENCIA"] > 0) & (~pr["EN_CAMINO"]) &
                  ((pr["DIAS_SIN_VENDER"] > lim) | pr["ULTIMA"].isna())].copy()
         est["CAPITAL"] = est["EXISTENCIA"] * est["PRECIO_COMPRA"]
         est = est.sort_values("CAPITAL", ascending=False)

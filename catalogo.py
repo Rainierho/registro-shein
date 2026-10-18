@@ -49,7 +49,7 @@ def _matriz(valores):
 @st.cache_data(ttl=300, show_spinner="Cargando catálogo...")
 def cargar(backend, id_hoja):
     """La caché depende de qué hoja se lee: si cambias los Secrets, no reusa lo viejo."""
-    tabs = ("INVENTARIO", "VENTAS", "CONFIG")
+    tabs = ("INVENTARIO", "VENTAS", "CONFIG", "LOTES")
     if backend == "gsheets":
         import gspread
         from google.oauth2.service_account import Credentials
@@ -163,7 +163,14 @@ inv["PRECIO"] = inv["PRECIO_VENTA"].map(_num)
 vendidas = (ven["NOMBRE"].astype(str).str.strip().value_counts()
             if len(ven) and "NOMBRE" in ven.columns else pd.Series(dtype=int))
 inv["QUEDAN"] = (inv["CANTIDAD"] - inv["NOMBRE"].map(vendidas).fillna(0)).astype(int)
+lotes = datos["LOTES"]
+en_camino = set()
+if len(lotes) and {"LOTE", "ESTADO"} <= set(lotes.columns):
+    en_camino = {_num(l_) for l_, e in zip(lotes["LOTE"], lotes["ESTADO"])
+                 if str(e).strip().upper() == "EN CAMINO" and _num(l_) is not None}
+inv["LOTE_N"] = inv["LOTE"].map(_num) if "LOTE" in inv.columns else None
 disp = inv[(inv["QUEDAN"] > 0) & (inv["PRECIO"].fillna(0) > 0)
+           & (~inv["LOTE_N"].isin(en_camino))
            & (inv["OCULTAR"].astype(str).str.strip().str.upper() != "SI")].copy()
 disp["TIPO"] = disp["NOMBRE"].str.split().str[0].str.capitalize()
 
