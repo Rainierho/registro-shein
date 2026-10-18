@@ -15,8 +15,8 @@ import pandas as pd
 
 from migrar_sheet import SCOPES, celdas
 
-COLS = ["PERSONA", "TIPO", "DESCRIPCION", "COSTO", "COBRAR", "ABONADO", "FECHA",
-        "NOTA"]
+COLS = ["PERSONA", "TIPO", "DESCRIPCION", "COSTO", "COBRAR", "ABONADO", "MONEDA",
+        "FECHA", "ULT_ABONO", "NOTA"]
 
 
 def main():
@@ -51,7 +51,9 @@ def main():
             "COSTO": "",                       # desconocido
             "COBRAR": pd.to_numeric(r["MONTO"], errors="coerce"),
             "ABONADO": 0,
+            "MONEDA": "$",
             "FECHA": "",
+            "ULT_ABONO": "",
             "NOTA": " · ".join(nota),
         })
     enc = pd.DataFrame(filas, columns=COLS)

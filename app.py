@@ -22,8 +22,9 @@ TABS = {
     "VENTAS": ["NOMBRE", "MONTO", "FECHA", "LOTE"],
     "DEUDAS": ["DEUDOR", "MONTO", "BOLOS", "NOTA"],
     "CAJA": ["UBICACION", "MONTO", "MONEDA", "TASA"],
-    "ENCARGOS": ["PERSONA", "TIPO", "DESCRIPCION", "COSTO", "COBRAR", "ABONADO", "FECHA",
-                 "NOTA"],
+    "ENCARGOS": ["PERSONA", "TIPO", "DESCRIPCION", "COSTO", "COBRAR", "ABONADO", "MONEDA",
+                 "FECHA", "ULT_ABONO", "NOTA"],
+    "CONFIG": ["CLAVE", "VALOR"],
     "VENTAS_HIST": ["NOMBRE", "MONTO", "FECHA", "LOTE"],
     "INVENTARIO_HIST": ["NOMBRE", "SKU", "PROPIETARIO", "TALLA", "CANTIDAD", "PRECIO_COMPRA",
                         "PRECIO_VENTA", "TIPO", "CATEGORIA", "LOTE", "FECHA_LOTE"],
@@ -45,10 +46,11 @@ NUMERICAS = {
 # columnas de plata: siempre float, para que el editor acepte decimales
 DINERO = {"MONTO", "PRECIO_COMPRA", "PRECIO_VENTA", "BOLOS", "TASA", "COSTO", "COBRAR",
           "ABONADO"}
-FECHAS = {"VENTAS": ["FECHA"], "ENCARGOS": ["FECHA"], "VENTAS_HIST": ["FECHA"],
+FECHAS = {"VENTAS": ["FECHA"], "ENCARGOS": ["FECHA", "ULT_ABONO"], "VENTAS_HIST": ["FECHA"],
           "INVENTARIO_HIST": ["FECHA_LOTE"]}
 CLAVES = {"INVENTARIO": "NOMBRE", "VENTAS": "NOMBRE", "DEUDAS": "DEUDOR", "CAJA": "UBICACION",
-          "ENCARGOS": "PERSONA", "VENTAS_HIST": "NOMBRE", "INVENTARIO_HIST": "NOMBRE"}
+          "ENCARGOS": "PERSONA", "CONFIG": "CLAVE", "VENTAS_HIST": "NOMBRE",
+          "INVENTARIO_HIST": "NOMBRE"}
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -268,10 +270,18 @@ def ventas_calculadas(ven, inv):
     return ven
 
 
-def encargos_calculados(enc):
+def moneda_norm(serie):
+    m = serie.fillna("").astype(str).str.strip().str.upper()
+    return m.map(lambda x: "Bs" if x in ("BS", "BS.", "BOLIVARES", "BOLÍVARES", "VES")
+                 else "$")
+
+
+def encargos_calculados(enc, tasa=None):
     enc = enc.copy()
     if enc.empty:
-        for c in ("GANANCIA", "COSTO_CONOCIDO", "ESTA_PAGADO", "SALDO", "GAN_COBRADA"):
+        for c in ("GANANCIA", "COSTO_CONOCIDO", "ESTA_PAGADO", "SALDO", "GAN_COBRADA",
+                  "COBRAR_USD", "COSTO_USD", "ABONADO_USD", "SALDO_USD", "GANANCIA_USD",
+                  "GAN_COBRADA_USD", "SIN_TASA"):
             enc[c] = pd.Series(dtype="object")
         return enc
     enc["TIPO"] = enc["TIPO"].astype(str).str.strip().str.upper().replace(
@@ -285,7 +295,28 @@ def encargos_calculados(enc):
     # la ganancia se realiza al final: primero se repone el costo, el resto es ganancia
     enc["GAN_COBRADA"] = (enc["ABONADO"] - enc["COSTO"].fillna(0)).clip(lower=0)
     enc.loc[~enc["COSTO_CONOCIDO"], "GAN_COBRADA"] = pd.NA
+    # moneda: lo que está en Bs se lleva a dólares con la tasa del día
+    enc["MONEDA"] = moneda_norm(enc["MONEDA"])
+    factor = enc["MONEDA"].map(lambda m: 1.0 if m == "$" else (1 / tasa if tasa else float("nan")))
+    for c in ("COBRAR", "COSTO", "ABONADO", "SALDO", "GANANCIA", "GAN_COBRADA"):
+        enc[c + "_USD"] = pd.to_numeric(enc[c], errors="coerce") * factor
+    enc["SIN_TASA"] = (enc["MONEDA"] == "Bs") & (not tasa)
     return enc
+
+
+def caja_calculada(caja, tasa=None):
+    caja = caja.copy()
+    caja["MONEDA"] = moneda_norm(caja["MONEDA"]) if len(caja) else caja["MONEDA"]
+    factores = []
+    for _, r in caja.iterrows():
+        if r["MONEDA"] != "Bs":
+            factores.append(1.0)
+        else:
+            t = tasa or _num(r["TASA"]) or None
+            factores.append(1 / t if t else float("nan"))
+    caja["MONTO_USD"] = caja["MONTO"].fillna(0) * pd.Series(factores, index=caja.index,
+                                                           dtype="float64")
+    return caja
 
 
 def _num(v, default=0.0):
@@ -339,6 +370,80 @@ def campo_dinero(contenedor, etiqueta, valor=0.0, key=None, ayuda=None):
                                  key=key, help=ayuda)
 
 
+def plata(x, moneda="$"):
+    """Monto con su moneda: $1,234.00 o Bs 1,234.00."""
+    x = _num(x, None)
+    if x is None:
+        return "—"
+    return f"${x:,.2f}" if moneda != "Bs" else f"Bs {x:,.2f}"
+
+
+def avisar(texto):
+    """Mensaje que se muestra después del rerun (si no, la recarga lo borra)."""
+    st.session_state["aviso"] = texto
+
+
+NO_MOVER = "— No mover la caja —"
+
+
+def convertir(monto, de, a, tasa):
+    if de == a:
+        return monto
+    if not tasa:
+        return None
+    return monto * tasa if (de == "$" and a == "Bs") else monto / tasa
+
+
+def selector_caja(cont, etiqueta, key, mover_por_defecto=True):
+    """Ubicación de caja donde entra o sale la plata. Recuerda la última usada."""
+    ubis = sorted(x for x in CAJA["UBICACION"].unique() if x)
+    ops = [NO_MOVER] + ubis
+    ult = st.session_state.get("ult_caja")
+    if not mover_por_defecto:
+        idx = 0
+    elif ult in ops:
+        idx = ops.index(ult)
+    elif "EFECTIVO" in ops:
+        idx = ops.index("EFECTIVO")
+    else:
+        idx = 1 if ubis else 0
+    v = cont.selectbox(etiqueta, ops, index=idx, key=key)
+    return None if v == NO_MOVER else v
+
+
+def plan_caja(ubic, monto, moneda="$"):
+    """Valida un movimiento antes de guardar nada.
+    Devuelve (delta en la moneda de la ubicación, moneda de la ubicación, error)."""
+    if not ubic or abs(monto) < 0.0001:
+        return 0.0, None, None
+    fila = CAJA[CAJA["UBICACION"] == ubic]
+    mon_u = fila["MONEDA"].iloc[0] if len(fila) else "$"
+    delta = convertir(monto, moneda, mon_u, TASA)
+    if delta is None:
+        return None, mon_u, (f"{ubic} está en bolívares y no hay tasa del día. "
+                             "Cárgala en la barra lateral.")
+    actual = _num(fila["MONTO"].sum())
+    if actual + delta < -0.004:
+        return None, mon_u, (f"No alcanza: {ubic} tiene {plata(actual, mon_u)} y este "
+                             f"movimiento saca {plata(-delta, mon_u)}.")
+    return delta, mon_u, None
+
+
+def aplicar_caja(ubic, delta):
+    """Mueve el saldo de una ubicación. Devuelve texto para el mensaje de éxito."""
+    if not ubic or abs(delta) < 0.0001:
+        return ""
+    df = leer("CAJA")
+    df["MONTO"] = pd.to_numeric(df["MONTO"], errors="coerce").fillna(0).astype(float)
+    mascara = df["UBICACION"] == ubic
+    mon_u = moneda_norm(df.loc[mascara, "MONEDA"]).iloc[0] if mascara.any() else "$"
+    df.loc[mascara, "MONTO"] = df.loc[mascara, "MONTO"] + delta
+    guardar("CAJA", df)
+    st.session_state["ult_caja"] = ubic
+    verbo = "Entraron" if delta > 0 else "Salieron"
+    return f" {verbo} {plata(abs(delta), mon_u)} {'a' if delta > 0 else 'de'} {ubic}."
+
+
 # --------------------------------------------------------------------------
 # Carga
 # --------------------------------------------------------------------------
@@ -346,10 +451,15 @@ inv_raw = leer("INVENTARIO")
 ven_raw = leer("VENTAS")
 enc = leer("ENCARGOS")
 caja = leer("CAJA")
+cfg = leer("CONFIG")
+_cfg = dict(zip(cfg["CLAVE"].astype(str).str.upper(), cfg["VALOR"]))
+TASA = leer_monto(_cfg.get("TASA")) or None
+TASA_FECHA = str(_cfg.get("TASA_FECHA") or "")
 
 INV = inventario_calculado(inv_raw, ven_raw)
 VEN = ventas_calculadas(ven_raw, inv_raw)
-ENC = encargos_calculados(enc)
+ENC = encargos_calculados(enc, TASA)
+CAJA = caja_calculada(caja, TASA)
 PEND = ENC[~ENC["ESTA_PAGADO"]]
 
 # --------------------------------------------------------------------------
@@ -370,6 +480,23 @@ with st.sidebar:
                  "Revísalo: si lo generaste en PowerShell, guárdalo en UTF-8 sin BOM.", icon="🔑")
     if BACKEND != "gsheets":
         st.warning("Modo Excel local: en Streamlit Cloud los cambios NO se guardan.", icon="⚠️")
+    st.caption("Tasa del día (Bs por $)" + (f" · {TASA_FECHA}" if TASA_FECHA else ""))
+    with st.form("form_tasa", clear_on_submit=False, border=False):
+        tasa_txt = st.text_input("Tasa", value=fmt_monto(TASA), placeholder="Ej. 312,45",
+                                 label_visibility="collapsed")
+        if st.form_submit_button("Guardar tasa", width="stretch"):
+            nueva = leer_monto(tasa_txt)
+            if not nueva or nueva <= 0:
+                st.error("Tasa inválida.")
+            else:
+                guardar("CONFIG", pd.DataFrame([
+                    {"CLAVE": "TASA", "VALOR": f"{nueva}"},
+                    {"CLAVE": "TASA_FECHA", "VALOR": f"{dt.date.today():%d/%m/%Y}"}]))
+                st.rerun()
+    if not TASA and (CAJA["MONEDA"].eq("Bs").any() or ENC["MONEDA"].eq("Bs").any()):
+        st.warning("Hay montos en bolívares y no hay tasa: no se suman a los totales.",
+                   icon="💱")
+    st.divider()
     if st.button("🔄 Refrescar datos", width="stretch"):
         st.cache_data.clear()
         st.rerun()
@@ -387,6 +514,9 @@ with st.sidebar:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         width="stretch",
     )
+
+if "aviso" in st.session_state:
+    st.success(st.session_state.pop("aviso"), icon="✅")
 
 # --------------------------------------------------------------------------
 # DASHBOARD
@@ -547,14 +677,14 @@ if seccion == "📊 Dashboard":
 
     st.subheader("Proyección: cobrar todo y liquidar el stock")
 
-    caja_hoy = caja["MONTO"].sum()
-    por_cobrar = PEND["SALDO"].sum() if len(PEND) else 0.0
+    caja_hoy = CAJA["MONTO_USD"].sum()
+    por_cobrar = PEND["SALDO_USD"].sum() if len(PEND) else 0.0
     con_costo = PEND[PEND["COSTO_CONOCIDO"]] if len(PEND) else PEND
-    gan_encargos = (con_costo["GANANCIA"].sum()
-                    - con_costo["GAN_COBRADA"].fillna(0).sum()) if len(con_costo) else 0.0
+    gan_encargos = (con_costo["GANANCIA_USD"].sum()
+                    - con_costo["GAN_COBRADA_USD"].fillna(0).sum()) if len(con_costo) else 0.0
     recuperacion = por_cobrar - gan_encargos
     sin_costo_enc = int((~PEND["COSTO_CONOCIDO"]).sum()) if len(PEND) else 0
-    monto_sin_costo = PEND[~PEND["COSTO_CONOCIDO"]]["SALDO"].sum() if len(PEND) else 0.0
+    monto_sin_costo = PEND[~PEND["COSTO_CONOCIDO"]]["SALDO_USD"].sum() if len(PEND) else 0.0
 
     stock_costo = INV["COSTO_STOCK"].sum()
     stock_venta = INV["VALOR_STOCK"].sum()
@@ -592,6 +722,13 @@ if seccion == "📊 Dashboard":
             f"gastaste comprando el encargo y {money(gan_encargos)} es ganancia tuya. "
             f"De la venta del stock, {money(stock_costo)} recupera el costo y "
             f"{money(potencial)} es ganancia.")
+    sin_tasa_n = int(CAJA["MONTO_USD"].isna().sum()) + int(PEND["SALDO_USD"].isna().sum()
+                                                           if len(PEND) else 0)
+    if sin_tasa_n:
+        nota += (f" {sin_tasa_n} montos en bolívares quedaron fuera porque no hay tasa del "
+                 "día cargada.")
+    elif TASA:
+        nota += f" Bolívares convertidos a {TASA:,.2f} Bs/$."
     if sin_costo_enc:
         nota += (f" Ojo: {sin_costo_enc} encargos ({money(monto_sin_costo)}) no tienen el costo "
                  "anotado, así que esa parte no se puede repartir.")
@@ -599,7 +736,7 @@ if seccion == "📊 Dashboard":
 
     st.divider()
     st.subheader("Resultado acumulado de la etapa")
-    gan_enc_cobrada = ENC["GAN_COBRADA"].fillna(0).sum() if len(ENC) else 0.0
+    gan_enc_cobrada = ENC["GAN_COBRADA_USD"].fillna(0).sum() if len(ENC) else 0.0
     k = st.columns(3)
     k[0].metric("Ganancia de reventa", money(realizada))
     k[1].metric("Ganancia de encargos cobrada", money(gan_enc_cobrada))
@@ -622,16 +759,21 @@ elif seccion == "🧾 Ventas":
                 monto_txt = campo_dinero(c[1], "Monto $", 5.0)
                 fecha = c[2].date_input("Fecha", value=dt.date.today(), format="DD/MM/YYYY")
                 lote = c[3].number_input("Lote", min_value=0, step=1, value=0)
+                ubic = selector_caja(st, "¿Dónde entró la plata?", "caja_venta_libre")
                 if st.form_submit_button("Guardar venta", type="primary"):
                     monto = leer_monto(monto_txt)
+                    delta, _, err = plan_caja(ubic, monto or 0)
                     if not nombre:
                         st.error("Falta el nombre del producto.")
                     elif monto is None or monto <= 0:
                         st.error(f"Monto inválido: «{monto_txt}». Escribe por ejemplo 5 o 5,50.")
+                    elif err:
+                        st.error(err)
                     else:
                         agregar("VENTAS", {"NOMBRE": nombre, "MONTO": monto,
                                            "FECHA": pd.Timestamp(fecha), "LOTE": lote or None})
-                        st.success(f"Venta registrada: {nombre}")
+                        extra = aplicar_caja(ubic, delta)
+                        avisar(f"Venta registrada: {nombre} · {money(monto)}.{extra}")
                         st.rerun()
         elif disponibles.empty:
             st.warning("No hay productos con existencia. Carga inventario o usa producto libre.")
@@ -651,10 +793,16 @@ elif seccion == "🧾 Ventas":
                 lote = c[2].number_input("Lote", min_value=0, step=1,
                                          value=_ent(prod["LOTE"]), key=f"lote_venta_{nombre}")
                 cantidad = c[3].number_input("Unidades", min_value=1, step=1, value=1)
+                ubic = selector_caja(st, "¿Dónde entró la plata?", "caja_venta")
                 enviado = st.form_submit_button("Guardar venta", type="primary")
                 monto = leer_monto(monto_txt)
+                delta, _, err = plan_caja(ubic, (monto or 0) * int(cantidad))
                 if enviado and (monto is None or monto <= 0):
                     st.error(f"Monto inválido: «{monto_txt}». Escribe por ejemplo 5 o 5,50.")
+                elif enviado and int(cantidad) > _ent(prod["EXISTENCIA"]):
+                    st.error(f"Solo quedan {_ent(prod['EXISTENCIA'])} de {nombre}.")
+                elif enviado and err:
+                    st.error(err)
                 elif enviado:
                     df = leer("VENTAS")
                     nuevas = pd.DataFrame([{
@@ -662,7 +810,9 @@ elif seccion == "🧾 Ventas":
                         "FECHA": pd.Timestamp(fecha), "LOTE": lote or None,
                     }] * int(cantidad))
                     guardar("VENTAS", pd.concat([df, nuevas], ignore_index=True))
-                    st.success(f"{int(cantidad)} venta(s) de {nombre} · {money(monto*cantidad)}")
+                    extra = aplicar_caja(ubic, delta)
+                    avisar(f"{int(cantidad)} venta(s) de {nombre} · "
+                           f"{money(monto * cantidad)}.{extra}")
                     st.rerun()
 
     st.divider()
@@ -710,12 +860,23 @@ elif seccion == "🧾 Ventas":
             ops[f"#{n} · {fecha} · {r.NOMBRE} · {money(r.MONTO)}{lote}"] = r.Index
         if ops:
             elegida = st.selectbox("Venta a eliminar", list(ops.keys()), key="borrar_ven")
+            ubic = selector_caja(st, "Devolver la plata desde",
+                                 "caja_borrar_ven", mover_por_defecto=False)
+            st.caption("Si al registrarla movió la caja, elige la misma ubicación para "
+                       "revertirlo. Si fue un duplicado que nunca entró, deja «No mover».")
             conf = st.checkbox("Sí, quiero borrar esta venta", key="conf_borrar_ven")
             if st.button("🗑️ Eliminar venta", disabled=not conf, key="btn_borrar_ven"):
-                df = leer("VENTAS")
-                guardar("VENTAS", df.drop(index=ops[elegida]))
-                st.success("Venta eliminada. La existencia del producto se recalcula sola.")
-                st.rerun()
+                monto_v = _num(ven_raw.loc[ops[elegida], "MONTO"])
+                delta, _, err = plan_caja(ubic, -monto_v)
+                if err:
+                    st.error(err)
+                else:
+                    df = leer("VENTAS")
+                    guardar("VENTAS", df.drop(index=ops[elegida]))
+                    extra = aplicar_caja(ubic, delta)
+                    avisar("Venta eliminada. La existencia del producto se recalcula sola."
+                           + extra)
+                    st.rerun()
 
     with st.expander("✏️ Editar / eliminar histórico de ventas"):
         st.caption("Edita celdas, agrega filas o marca filas y presiona Supr para borrar.")
@@ -730,7 +891,7 @@ elif seccion == "🧾 Ventas":
         )
         if st.button("💾 Guardar cambios de ventas", type="primary"):
             guardar("VENTAS", edit)
-            st.success("Ventas actualizadas.")
+            avisar("Ventas actualizadas.")
             st.rerun()
 
 # --------------------------------------------------------------------------
@@ -750,10 +911,17 @@ elif seccion == "📦 Inventario":
             pv_txt = campo_dinero(c[2], "Precio venta $", 5.0)
             lote = c[3].number_input("Lote", min_value=0, step=1,
                                      value=_ent(INV["LOTE"].max() if len(INV) else 0))
+            ubic = selector_caja(st, "¿De dónde salió el pago?", "caja_nuevo_prod",
+                                 mover_por_defecto=False)
+            st.caption("Elige la ubicación si estás registrando una compra nueva. "
+                       "Deja «No mover» si solo pasas al sistema algo ya pagado.")
             if st.form_submit_button("Agregar", type="primary"):
                 pc, pv = leer_monto(pc_txt), leer_monto(pv_txt)
+                delta, _, err = plan_caja(ubic, -(pc or 0) * int(cant))
                 if pc is None or pv is None:
                     st.error("Revisa los precios: escribe por ejemplo 1,77 o 5.")
+                elif err:
+                    st.error(err)
                 elif not nombre:
                     st.error("El nombre corto es obligatorio.")
                 elif nombre in set(inv_raw["NOMBRE"]):
@@ -763,7 +931,8 @@ elif seccion == "📦 Inventario":
                         "DESCRIPCION": desc, "NOMBRE": nombre, "CANTIDAD": cant,
                         "PRECIO_COMPRA": pc, "PRECIO_VENTA": pv, "LOTE": lote,
                     })
-                    st.success(f"{nombre} agregado.")
+                    extra = aplicar_caja(ubic, delta)
+                    avisar(f"{nombre} agregado.{extra}")
                     st.rerun()
 
     c1, c2, c3 = st.columns([2, 1, 1])
@@ -817,7 +986,7 @@ elif seccion == "📦 Inventario":
         )
         if st.button("💾 Guardar inventario", type="primary"):
             guardar("INVENTARIO", edit)
-            st.success("Inventario actualizado.")
+            avisar("Inventario actualizado.")
             st.rerun()
 
 # --------------------------------------------------------------------------
@@ -827,78 +996,159 @@ elif seccion == "🎁 Por cobrar":
     st.header("Encargos y préstamos")
     st.caption("Encargo: compras algo para alguien y le cobras más de lo que te costó. "
                "Préstamo: sale plata de SHEIN y vuelve igual. Como pagan por partes, "
-               "lo que importa es ABONADO contra COBRAR.")
+               "lo que importa es ABONADO contra COBRAR. Los totales van en dólares; "
+               "lo que esté en bolívares se convierte con la tasa del día.")
 
     pend = PEND
+    con_c = pend[pend["COSTO_CONOCIDO"]] if len(pend) else pend
     k = st.columns(4)
-    k[0].metric("Saldo por cobrar", money(pend["SALDO"].sum() if len(pend) else 0),
+    k[0].metric("Saldo por cobrar", money(pend["SALDO_USD"].sum() if len(pend) else 0),
                 f"{len(pend)} abiertos")
-    k[1].metric("Ya abonado", money(ENC["ABONADO"].sum() if len(ENC) else 0),
-                f"de {money(ENC['COBRAR'].sum() if len(ENC) else 0)} en total")
+    k[1].metric("Ya abonado", money(ENC["ABONADO_USD"].sum() if len(ENC) else 0),
+                f"de {money(ENC['COBRAR_USD'].sum() if len(ENC) else 0)} en total")
     k[2].metric("Ganancia pendiente",
-                money(pend[pend["COSTO_CONOCIDO"]]["GANANCIA"].sum()
-                      - pend[pend["COSTO_CONOCIDO"]]["GAN_COBRADA"].fillna(0).sum()
-                      if len(pend) else 0))
+                money(con_c["GANANCIA_USD"].sum() - con_c["GAN_COBRADA_USD"].fillna(0).sum()
+                      if len(con_c) else 0))
     k[3].metric("Ganancia ya cobrada",
-                money(ENC["GAN_COBRADA"].fillna(0).sum() if len(ENC) else 0))
+                money(ENC["GAN_COBRADA_USD"].fillna(0).sum() if len(ENC) else 0))
 
     if len(pend):
-        por_tipo = pend.groupby("TIPO")["SALDO"].agg(["size", "sum"])
+        por_tipo = pend.groupby("TIPO")["SALDO_USD"].agg(["size", "sum"])
         st.caption(" · ".join(f"{tp}: {int(r['size'])} por {money(r['sum'])}"
                               for tp, r in por_tipo.iterrows()))
+        if pend["SIN_TASA"].any():
+            n_bs = int(pend["SIN_TASA"].sum())
+            st.warning(f"{n_bs} cuentas en bolívares no entran a los totales: falta la tasa "
+                       "del día en la barra lateral.", icon="💱")
         faltan = pend[(~pend["COSTO_CONOCIDO"]) | (pend["TIPO"] == "SIN CLASIFICAR")]
         if len(faltan):
             st.warning(
-                f"{len(faltan)} filas ({money(faltan['SALDO'].sum())}) están incompletas: "
-                "les falta el tipo o el costo. En un préstamo sin interés, COSTO va igual "
-                "a COBRAR.", icon="✏️")
+                f"{len(faltan)} filas están incompletas: les falta el tipo o el costo. "
+                "En un préstamo sin interés, COSTO va igual a COBRAR.", icon="✏️")
 
+    # ---------------- antigüedad ----------------
+    if len(pend):
+        st.subheader("⏳ Antigüedad de las deudas")
+        hoy = pd.Timestamp(dt.date.today())
+        per = (pend.groupby("PERSONA")
+               .agg(SALDO=("SALDO_USD", "sum"), CUENTAS=("SALDO_USD", "size"),
+                    ABIERTA_DESDE=("FECHA", "min"))
+               .reset_index())
+        # último abono de la persona en cualquiera de sus cuentas, saldadas o no:
+        # una cuenta nueva no reinicia el reloj, un pago sí
+        ult = ENC.groupby("PERSONA")["ULT_ABONO"].max()
+        per["ULTIMO_ABONO"] = per["PERSONA"].map(ult)
+        desde = per["ULTIMO_ABONO"].where(per["ULTIMO_ABONO"].notna(), per["ABIERTA_DESDE"])
+        per["DIAS"] = (hoy - pd.to_datetime(desde)).dt.days
+        # nunca abonó y alguna cuenta abierta no tiene fecha: la antigüedad real se desconoce
+        sin_f = pend.groupby("PERSONA")["FECHA"].apply(lambda s: s.isna().any())
+        desconocida = per["ULTIMO_ABONO"].isna() & per["PERSONA"].map(sin_f).fillna(False)
+        per.loc[desconocida, "DIAS"] = float("nan")
+
+        def semaforo(d):
+            if pd.isna(d):
+                return "⚪ sin fecha"
+            if d <= 30:
+                return "🟢 al día"
+            if d <= 60:
+                return "🟡 atento"
+            return "🔴 cobrar"
+
+        per["ESTADO"] = per["DIAS"].map(semaforo)
+        per = per.sort_values(["DIAS", "SALDO"], ascending=[False, False], na_position="first")
+        st.dataframe(
+            per[["ESTADO", "PERSONA", "SALDO", "DIAS", "ULTIMO_ABONO", "CUENTAS"]],
+            width="stretch", hide_index=True, height=min(38 * (len(per) + 1), 330),
+            column_config={
+                "SALDO": st.column_config.NumberColumn("Debe ($)", format="$%.2f"),
+                "DIAS": st.column_config.NumberColumn("Días sin abonar", format="%d"),
+                "ULTIMO_ABONO": st.column_config.DateColumn("Último abono",
+                                                            format="DD/MM/YYYY"),
+            },
+        )
+        st.caption("Días desde su último abono; si nunca abonó, desde su cuenta abierta más "
+                   "vieja. Prestarle de nuevo no reinicia el reloj. "
+                   "🟢 hasta 30 días · 🟡 31 a 60 · 🔴 más de 60.")
+        sin_fecha = pend[pend["FECHA"].isna() & pend["ULT_ABONO"].isna()]
+        if len(sin_fecha):
+            st.info(f"{len(sin_fecha)} cuentas no tienen fecha, así que no se puede medir su "
+                    "antigüedad. Lo ideal es poner la fecha aproximada en «✏️ Editar»; si no "
+                    "la recuerdas, empieza a contar desde hoy.", icon="📅")
+            if st.button("📅 Empezar a contar desde hoy", key="btn_fecha_hoy"):
+                df = leer("ENCARGOS")
+                vacias = df["FECHA"].isna() & df.index.isin(sin_fecha.index)
+                df.loc[vacias, "FECHA"] = pd.Timestamp(dt.date.today())
+                guardar("ENCARGOS", df)
+                avisar(f"{int(vacias.sum())} cuentas ahora cuentan desde hoy.")
+                st.rerun()
+
+    # ---------------- abono ----------------
     if len(pend):
         st.subheader("Registrar un abono")
-        tot_pers = (pend.groupby("PERSONA")
-                    .agg(SALDO=("SALDO", "sum"), N=("SALDO", "size")).reset_index()
-                    .sort_values("SALDO", ascending=False))
-        etiquetas = {
-            f"{r.PERSONA} · debe {money(r.SALDO)}"
-            + (f" · {int(r.N)} cuentas" if r.N > 1 else ""): r.PERSONA
-            for r in tot_pers.itertuples()
-        }
-        sel = st.selectbox("Persona", list(etiquetas.keys()), label_visibility="collapsed")
+        filas = []
+        for persona_i, g in pend.groupby("PERSONA"):
+            mon = g["MONEDA"].unique()
+            if len(mon) == 1:
+                etiqueta = f"{persona_i} · debe {plata(g['SALDO'].sum(), mon[0])}"
+            else:
+                etiqueta = f"{persona_i} · debe ≈ {money(g['SALDO_USD'].sum())} (mixto)"
+            if len(g) > 1:
+                etiqueta += f" · {len(g)} cuentas"
+            filas.append((g["SALDO_USD"].sum(), etiqueta, persona_i))
+        filas.sort(key=lambda x: (-(x[0] if pd.notna(x[0]) else 0), x[1]))
+        etiquetas = {e: p_ for _, e, p_ in filas}
+        sel = st.selectbox("Persona", list(etiquetas.keys()), label_visibility="collapsed",
+                           key="abono_persona")
         quien = etiquetas[sel]
         cuentas = pend[pend["PERSONA"] == quien].sort_values("FECHA", na_position="first")
+        monedas = cuentas["MONEDA"].unique()
 
         destino = "TODAS"
         if len(cuentas) > 1:
-            ops = {"Repartir entre sus cuentas, de la más antigua primero": "TODAS"}
+            ops = {}
+            if len(monedas) == 1:
+                ops["Repartir entre sus cuentas, de la más antigua primero"] = "TODAS"
             for n, r in enumerate(cuentas.itertuples(), 1):
                 fecha = f" · {r.FECHA:%d/%m/%Y}" if pd.notna(r.FECHA) else ""
                 ops[f"Cuenta {n}: {r.TIPO.lower()}"
                     + (f" · {r.DESCRIPCION}" if r.DESCRIPCION else "")
-                    + fecha + f" · debe {money(r.SALDO)}"] = r.Index
-            destino = ops[st.selectbox("Aplicar a", list(ops.keys()))]
+                    + fecha + f" · debe {plata(r.SALDO, r.MONEDA)}"] = r.Index
+            destino = ops[st.selectbox("Aplicar a", list(ops.keys()), key="abono_destino")]
+            if len(monedas) > 1:
+                st.caption("Tiene cuentas en dólares y en bolívares: elige a cuál va el abono.")
 
+        mon_ab = monedas[0] if destino == "TODAS" else ENC.loc[destino, "MONEDA"]
         saldo = (_num(cuentas["SALDO"].sum()) if destino == "TODAS"
                  else _num(ENC.loc[destino, "SALDO"]))
 
         with st.form("abono", clear_on_submit=True):
-            c = st.columns([2, 1, 2])
-            monto_txt = campo_dinero(c[0], "Abono $",
-                                     ayuda=f"Debe {money(saldo)}. Marca 'Saldó todo' "
+            c = st.columns([2, 1, 1])
+            monto_txt = campo_dinero(c[0], f"Abono ({mon_ab})",
+                                     ayuda=f"Debe {plata(saldo, mon_ab)}. Marca 'Saldó todo' "
                                            "si te pagó completo.")
-            todo = c[1].checkbox("Saldó todo")
-            if c[2].form_submit_button("Registrar abono", type="primary"):
+            fecha_ab = c[1].date_input("Fecha del abono", value=dt.date.today(),
+                                       format="DD/MM/YYYY")
+            todo = c[2].checkbox("Saldó todo")
+            ubic = selector_caja(st, "¿Dónde entró el abono?", "caja_abono")
+            if st.form_submit_button("Registrar abono", type="primary"):
                 monto = leer_monto(monto_txt)
                 pago = saldo if todo else monto
+                delta, _, err = plan_caja(ubic, pago or 0, mon_ab)
                 if pago is None:
                     st.error(f"Monto inválido: «{monto_txt}». Escribe por ejemplo 10 o 10,50.")
                 elif pago <= 0:
                     st.error("El abono debe ser mayor que cero.")
                 elif pago > saldo + 0.004:
-                    st.error(f"Te está abonando {money(pago)} pero solo debe {money(saldo)}.")
+                    st.error(f"Te está abonando {plata(pago, mon_ab)} pero solo debe "
+                             f"{plata(saldo, mon_ab)}.")
+                elif err:
+                    st.error(err)
                 else:
                     df = leer("ENCARGOS")
                     df["ABONADO"] = pd.to_numeric(df["ABONADO"], errors="coerce") \
                         .fillna(0).astype(float)
+                    f_ab = pd.Timestamp(fecha_ab)
+                    tocadas = []
                     if destino == "TODAS":
                         resto = pago
                         for idx in cuentas.index:
@@ -906,17 +1156,25 @@ elif seccion == "🎁 Por cobrar":
                                 break
                             aplica = min(resto, _num(ENC.loc[idx, "SALDO"]))
                             df.loc[idx, "ABONADO"] = _num(df.loc[idx, "ABONADO"]) + aplica
+                            tocadas.append(idx)
                             resto -= aplica
                     else:
                         df.loc[destino, "ABONADO"] = _num(df.loc[destino, "ABONADO"]) + pago
+                        tocadas.append(destino)
+                    for idx in tocadas:
+                        previo = df.loc[idx, "ULT_ABONO"]
+                        if pd.isna(previo) or f_ab > pd.Timestamp(previo):
+                            df.loc[idx, "ULT_ABONO"] = f_ab
                     guardar("ENCARGOS", df)
+                    extra = aplicar_caja(ubic, delta)
                     resta = saldo - pago
-                    st.success(f"Abono de {money(pago)} de {quien}. "
-                               + ("Queda al día." if resta <= 0.004
-                                  else f"Le queda debiendo {money(resta)}.")
-                               + " Acuérdate de sumarlo en Caja Chica.")
+                    avisar(f"Abono de {plata(pago, mon_ab)} de {quien}. "
+                           + ("Queda al día." if resta <= 0.004
+                              else f"Le queda debiendo {plata(resta, mon_ab)}.")
+                           + (extra or " No se movió la caja."))
                     st.rerun()
 
+    # ---------------- alta ----------------
     st.divider()
     tipo = st.radio("Registrar algo nuevo", ["Encargo", "Préstamo"], horizontal=True)
     with st.expander(f"➕ Nuevo {tipo.lower()}", expanded=ENC.empty):
@@ -931,22 +1189,29 @@ elif seccion == "🎁 Por cobrar":
             persona = elegida
             abiertas = ENC[(ENC["PERSONA"] == persona) & (~ENC["ESTA_PAGADO"])]
             if len(abiertas):
-                c[1].caption(f"Ya debe {money(abiertas['SALDO'].sum())} "
+                c[1].caption(f"Ya debe {money(abiertas['SALDO_USD'].sum())} "
                              f"en {len(abiertas)} cuenta(s).")
 
         if tipo == "Encargo":
             with st.form("nuevo_encargo", clear_on_submit=True):
-                desc = st.text_input("Qué pidió")
+                c = st.columns([3, 1])
+                desc = c[0].text_input("Qué pidió")
+                mon = c[1].selectbox("Moneda", ["$", "Bs"], key="mon_enc")
                 c = st.columns(4)
-                costo_txt = campo_dinero(c[0], "Costo $ (lo que gastaste)")
-                cobrar_txt = campo_dinero(c[1], "Cobrar $")
-                abonado_txt = campo_dinero(c[2], "Ya abonó $")
+                costo_txt = campo_dinero(c[0], "Costo (lo que gastaste)")
+                cobrar_txt = campo_dinero(c[1], "Cobrar")
+                abonado_txt = campo_dinero(c[2], "Ya abonó")
                 fecha = c[3].date_input("Fecha", value=dt.date.today(), format="DD/MM/YYYY")
+                c = st.columns([2, 3])
+                ubic = selector_caja(c[0], "Caja", "caja_enc")
+                c[1].caption("Del lugar elegido sale el costo y entra lo que ya abonó.")
                 nota = st.text_input("Nota")
                 if st.form_submit_button("Guardar encargo", type="primary"):
                     costo = leer_monto(costo_txt)
                     cobrar = leer_monto(cobrar_txt)
                     abonado = leer_monto(abonado_txt)
+                    neto = (abonado or 0) - (costo or 0)
+                    delta, _, err = plan_caja(ubic, neto, mon)
                     if not persona:
                         st.error("Falta la persona.")
                     elif None in (costo, cobrar, abonado):
@@ -955,54 +1220,70 @@ elif seccion == "🎁 Por cobrar":
                         st.error("Falta el monto a cobrar.")
                     elif abonado > cobrar + 0.004:
                         st.error("Lo abonado no puede pasar de lo que se cobra.")
+                    elif err:
+                        st.error(err)
                     else:
                         agregar("ENCARGOS", {
                             "PERSONA": persona, "TIPO": "ENCARGO", "DESCRIPCION": desc,
                             "COSTO": costo or None, "COBRAR": cobrar, "ABONADO": abonado,
-                            "FECHA": pd.Timestamp(fecha), "NOTA": nota,
+                            "MONEDA": mon, "FECHA": pd.Timestamp(fecha),
+                            "ULT_ABONO": pd.Timestamp(fecha) if abonado else None,
+                            "NOTA": nota,
                         })
-                        st.success(f"Encargo de {persona}: cobras {money(cobrar)}"
-                                   + (f", ganas {money(cobrar - costo)}" if costo else ""))
+                        extra = aplicar_caja(ubic, delta)
+                        avisar(f"Encargo de {persona}: cobras {plata(cobrar, mon)}"
+                               + (f", ganas {plata(cobrar - costo, mon)}" if costo else "")
+                               + "." + extra)
                         st.rerun()
         else:
             with st.form("nuevo_prestamo", clear_on_submit=True):
-                c = st.columns(2)
-                prestado_txt = campo_dinero(c[0], "Monto prestado $")
-                cobrar_txt = campo_dinero(c[1], "A cobrar $",
+                c = st.columns([1, 1, 1])
+                prestado_txt = campo_dinero(c[0], "Monto prestado")
+                cobrar_txt = campo_dinero(c[1], "A cobrar",
                                           ayuda="Déjalo vacío si no cobras interés.")
+                mon = c[2].selectbox("Moneda", ["$", "Bs"], key="mon_pre")
                 c = st.columns([1, 1, 3])
-                abonado_txt = campo_dinero(c[0], "Ya abonó $")
+                abonado_txt = campo_dinero(c[0], "Ya abonó")
                 fecha = c[1].date_input("Fecha", value=dt.date.today(), format="DD/MM/YYYY")
                 nota = c[2].text_input("Nota")
+                ubic = selector_caja(st, "¿De dónde salió la plata prestada?", "caja_pre")
                 if st.form_submit_button("Guardar préstamo", type="primary"):
                     prestado = leer_monto(prestado_txt)
                     cobrar = leer_monto(cobrar_txt)
                     abonado = leer_monto(abonado_txt)
+                    neto = (abonado or 0) - (prestado or 0)
+                    delta, _, err = plan_caja(ubic, neto, mon)
+                    total = (cobrar if cobrar and cobrar > 0 else prestado) or 0
                     if not persona:
                         st.error("Falta la persona.")
                     elif None in (prestado, cobrar, abonado):
                         st.error("Revisa los montos: escribe por ejemplo 50 o 50,25.")
                     elif prestado <= 0:
                         st.error("Falta el monto prestado.")
+                    elif abonado > total + 0.004:
+                        st.error("Lo abonado no puede pasar de lo que se cobra.")
+                    elif err:
+                        st.error(err)
                     else:
-                        total = cobrar if cobrar > 0 else prestado
-                        if abonado > total + 0.004:
-                            st.error("Lo abonado no puede pasar de lo que se cobra.")
-                        else:
-                            agregar("ENCARGOS", {
-                                "PERSONA": persona, "TIPO": "PRÉSTAMO", "DESCRIPCION": "",
-                                "COSTO": prestado, "COBRAR": total, "ABONADO": abonado,
-                                "FECHA": pd.Timestamp(fecha), "NOTA": nota,
-                            })
-                            extra = total - prestado
-                            st.success(f"Préstamo a {persona} por {money(prestado)}"
-                                       + (f", cobras {money(extra)} de más" if extra else ""))
-                            st.rerun()
+                        agregar("ENCARGOS", {
+                            "PERSONA": persona, "TIPO": "PRÉSTAMO", "DESCRIPCION": "",
+                            "COSTO": prestado, "COBRAR": total, "ABONADO": abonado,
+                            "MONEDA": mon, "FECHA": pd.Timestamp(fecha),
+                            "ULT_ABONO": pd.Timestamp(fecha) if abonado else None,
+                            "NOTA": nota,
+                        })
+                        extra = aplicar_caja(ubic, delta)
+                        dif = total - prestado
+                        avisar(f"Préstamo a {persona} por {plata(prestado, mon)}"
+                               + (f", cobras {plata(dif, mon)} de más" if dif else "")
+                               + "." + extra)
+                        st.rerun()
 
     if ENC.empty:
         st.info("Todavía no hay nada cargado.")
         st.stop()
 
+    # ---------------- listado ----------------
     st.divider()
     c1, c2, c3 = st.columns([2, 1, 1])
     busq = c1.text_input("Buscar persona").strip().upper()
@@ -1020,52 +1301,58 @@ elif seccion == "🎁 Por cobrar":
         e = e[e["ESTA_PAGADO"]]
 
     detalle = st.checkbox("Ver cuenta por cuenta", value=False)
-
     if detalle:
         st.dataframe(
-            e[["PERSONA", "TIPO", "DESCRIPCION", "COSTO", "COBRAR", "ABONADO", "SALDO",
-               "GANANCIA", "FECHA", "NOTA"]].sort_values(["SALDO", "PERSONA"],
-                                                         ascending=False),
+            e[["PERSONA", "TIPO", "DESCRIPCION", "MONEDA", "COSTO", "COBRAR", "ABONADO",
+               "SALDO", "GANANCIA", "FECHA", "ULT_ABONO", "NOTA"]]
+            .sort_values(["SALDO", "PERSONA"], ascending=False),
             width="stretch", hide_index=True, height=360,
             column_config={
-                "COSTO": st.column_config.NumberColumn(format="$%.2f"),
-                "COBRAR": st.column_config.NumberColumn(format="$%.2f"),
-                "ABONADO": st.column_config.NumberColumn(format="$%.2f"),
-                "SALDO": st.column_config.NumberColumn(format="$%.2f"),
-                "GANANCIA": st.column_config.NumberColumn(format="$%.2f"),
+                "COSTO": st.column_config.NumberColumn(format="%.2f"),
+                "COBRAR": st.column_config.NumberColumn(format="%.2f"),
+                "ABONADO": st.column_config.NumberColumn(format="%.2f"),
+                "SALDO": st.column_config.NumberColumn(format="%.2f"),
+                "GANANCIA": st.column_config.NumberColumn(format="%.2f"),
                 "FECHA": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                "ULT_ABONO": st.column_config.DateColumn("ÚLT. ABONO", format="DD/MM/YYYY"),
             },
         )
+        st.caption("En esta vista cada monto va en la moneda de su cuenta (columna MONEDA).")
     elif len(e):
         tot = (e.groupby("PERSONA")
-               .agg(CUENTAS=("COBRAR", "size"), COBRAR=("COBRAR", "sum"),
-                    ABONADO=("ABONADO", "sum"), SALDO=("SALDO", "sum"),
-                    GANANCIA=("GANANCIA", "sum"))
+               .agg(CUENTAS=("COBRAR_USD", "size"), COBRAR=("COBRAR_USD", "sum"),
+                    ABONADO=("ABONADO_USD", "sum"), SALDO=("SALDO_USD", "sum"),
+                    GANANCIA=("GANANCIA_USD", "sum"))
                .reset_index().sort_values("SALDO", ascending=False))
         tipos = e.groupby("PERSONA")["TIPO"].agg(lambda s: " + ".join(sorted(set(s))))
+        monedas_p = e.groupby("PERSONA")["MONEDA"].agg(lambda s: " + ".join(sorted(set(s))))
         tot["TIPO"] = tot["PERSONA"].map(tipos)
-        tot = tot[["PERSONA", "TIPO", "CUENTAS", "COBRAR", "ABONADO", "SALDO", "GANANCIA"]]
+        tot["MONEDA"] = tot["PERSONA"].map(monedas_p)
+        tot = tot[["PERSONA", "TIPO", "MONEDA", "CUENTAS", "COBRAR", "ABONADO", "SALDO",
+                   "GANANCIA"]]
         st.dataframe(
             tot, width="stretch", hide_index=True, height=360,
             column_config={
-                "COBRAR": st.column_config.NumberColumn(format="$%.2f"),
-                "ABONADO": st.column_config.NumberColumn(format="$%.2f"),
-                "SALDO": st.column_config.NumberColumn(format="$%.2f"),
-                "GANANCIA": st.column_config.NumberColumn(format="$%.2f"),
+                "COBRAR": st.column_config.NumberColumn("COBRAR ($)", format="$%.2f"),
+                "ABONADO": st.column_config.NumberColumn("ABONADO ($)", format="$%.2f"),
+                "SALDO": st.column_config.NumberColumn("SALDO ($)", format="$%.2f"),
+                "GANANCIA": st.column_config.NumberColumn("GANANCIA ($)", format="$%.2f"),
             },
         )
         st.caption(f"{len(tot)} personas · {len(e)} cuentas · saldo "
-                   f"{money(tot['SALDO'].sum())}")
-
-        if len(tot) > 1:
+                   f"{money(tot['SALDO'].sum())}. Todo en dólares; los bolívares se "
+                   "convierten con la tasa del día.")
+        graf = tot[tot["SALDO"].notna()]
+        if len(graf) > 1:
             st.plotly_chart(
-                px.bar(tot.sort_values("SALDO"), x="SALDO", y="PERSONA", orientation="h",
+                px.bar(graf.sort_values("SALDO"), x="SALDO", y="PERSONA", orientation="h",
                        labels={"SALDO": "$", "PERSONA": ""}),
                 width="stretch")
     else:
         st.info("Nada que mostrar con esos filtros.")
 
-    claves = ["PERSONA", "TIPO", "DESCRIPCION", "COSTO", "COBRAR", "FECHA"]
+    # ---------------- eliminar ----------------
+    claves = ["PERSONA", "TIPO", "DESCRIPCION", "COSTO", "COBRAR", "MONEDA", "FECHA"]
     dup = ENC[ENC.duplicated(subset=claves, keep=False)]
     if len(dup):
         nombres = ", ".join(sorted(dup["PERSONA"].unique()))
@@ -1082,20 +1369,32 @@ elif seccion == "🎁 Por cobrar":
             fecha = f" · {r.FECHA:%d/%m/%Y}" if pd.notna(r.FECHA) else " · sin fecha"
             ops[f"{marca}#{n} · {r.PERSONA} · {r.TIPO.lower()}"
                 + (f" · {r.DESCRIPCION}" if r.DESCRIPCION else "")
-                + f" · cobrar {money(r.COBRAR)} · abonado {money(r.ABONADO)}{fecha}"] = r.Index
-        primero = next((i for i, k in enumerate(ops) if k.startswith("⚠️")), 0)
+                + f" · cobrar {plata(r.COBRAR, r.MONEDA)} · abonado "
+                  f"{plata(r.ABONADO, r.MONEDA)}{fecha}"] = r.Index
+        primero = next((i for i, k_ in enumerate(ops) if k_.startswith("⚠️")), 0)
         elegida = st.selectbox("Cuenta a eliminar", list(ops.keys()), index=primero,
                                key="borrar_enc")
         idx_b = ops[elegida]
         if _num(ENC.loc[idx_b, "ABONADO"]) > 0:
-            st.info(f"Esta cuenta tiene {money(ENC.loc[idx_b, 'ABONADO'])} abonados. Si la "
-                    "otra copia no los tiene, borra mejor la que está en cero.")
+            st.info(f"Esta cuenta tiene {plata(ENC.loc[idx_b, 'ABONADO'], ENC.loc[idx_b, 'MONEDA'])} "
+                    "abonados. Si la otra copia no los tiene, borra mejor la que está en cero.")
+        ubic_b = selector_caja(st, "Revertir en caja", "caja_borrar_enc",
+                               mover_por_defecto=False)
+        st.caption("Si al registrarla movió la caja, elige la misma ubicación: se devuelve el "
+                   "costo y se saca lo abonado. Si fue un duplicado, deja «No mover».")
         conf = st.checkbox("Sí, quiero borrar esta cuenta", key="conf_borrar_enc")
         if st.button("🗑️ Eliminar", disabled=not conf, key="btn_borrar_enc"):
-            df = leer("ENCARGOS")
-            guardar("ENCARGOS", df.drop(index=idx_b))
-            st.success("Cuenta eliminada.")
-            st.rerun()
+            fila = ENC.loc[idx_b]
+            revertir = _num(fila["COSTO"]) - _num(fila["ABONADO"])
+            delta, _, err = plan_caja(ubic_b, revertir, fila["MONEDA"])
+            if err:
+                st.error(err)
+            else:
+                df = leer("ENCARGOS")
+                guardar("ENCARGOS", df.drop(index=idx_b))
+                extra = aplicar_caja(ubic_b, delta)
+                avisar("Cuenta eliminada." + extra)
+                st.rerun()
 
     with st.expander("✏️ Editar"):
         edit = st.data_editor(
@@ -1105,12 +1404,15 @@ elif seccion == "🎁 Por cobrar":
                 "COSTO": st.column_config.NumberColumn(format="%.2f"),
                 "COBRAR": st.column_config.NumberColumn(format="%.2f"),
                 "ABONADO": st.column_config.NumberColumn(format="%.2f"),
+                "MONEDA": st.column_config.SelectboxColumn(options=["$", "Bs"]),
                 "FECHA": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                "ULT_ABONO": st.column_config.DateColumn("ÚLT. ABONO", format="DD/MM/YYYY"),
             },
         )
+        st.caption("Editar aquí no mueve la caja: es para corregir datos.")
         if st.button("💾 Guardar", type="primary"):
             guardar("ENCARGOS", edit)
-            st.success("Actualizado.")
+            avisar("Actualizado.")
             st.rerun()
 
 # --------------------------------------------------------------------------
@@ -1118,79 +1420,123 @@ elif seccion == "🎁 Por cobrar":
 # --------------------------------------------------------------------------
 elif seccion == "💵 Caja Chica":
     st.header("Caja Chica")
-    k = st.columns(2)
-    k[0].metric("Total", money(caja["MONTO"].sum()))
-    k[1].metric("Ubicaciones", len(caja))
+    total_usd = CAJA["MONTO_USD"].sum()
+    k = st.columns(3)
+    k[0].metric("Total en dólares", money(total_usd))
+    bs = CAJA[CAJA["MONEDA"] == "Bs"]
+    k[1].metric("En bolívares", plata(bs["MONTO"].sum(), "Bs"),
+                f"≈ {money(bs['MONTO_USD'].sum())}" if len(bs) and TASA else None)
+    k[2].metric("Ubicaciones", len(CAJA))
+    if CAJA["MONTO_USD"].isna().any():
+        st.warning("Hay ubicaciones en bolívares que no entran al total: falta la tasa del "
+                   "día en la barra lateral.", icon="💱")
 
     st.subheader("Movimiento")
-    ubis = sorted(x for x in caja["UBICACION"].unique() if x)
+    ubis = sorted(x for x in CAJA["UBICACION"].unique() if x)
     c = st.columns([2, 2])
-    destino = c[0].selectbox("Ubicación", ubis + ["➕ Nueva ubicación"],
-                             key="caja_ubi")
+    destino = c[0].selectbox("Ubicación", ubis + ["➕ Nueva ubicación"], key="caja_ubi")
     if destino == "➕ Nueva ubicación":
         nombre = c[1].text_input("Nombre de la ubicación", key="caja_nueva").strip().upper()
+        mon_u = c[1].selectbox("Moneda de la ubicación", ["$", "Bs"], key="caja_nueva_mon")
         actual = 0.0
     else:
         nombre = destino
-        actual = _num(caja.loc[caja["UBICACION"] == nombre, "MONTO"].sum())
-        c[1].caption(f"Tiene {money(actual)}.")
+        fila = CAJA[CAJA["UBICACION"] == nombre]
+        mon_u = fila["MONEDA"].iloc[0]
+        actual = _num(fila["MONTO"].sum())
+        eq = (f" (≈ {money(fila['MONTO_USD'].sum())})"
+              if mon_u == "Bs" and pd.notna(fila["MONTO_USD"].sum()) else "")
+        c[1].caption(f"Tiene {plata(actual, mon_u)}{eq}.")
 
     with st.form("mov_caja", clear_on_submit=True):
-        c = st.columns([1, 1, 1, 1])
+        c = st.columns([1, 1, 2])
         signo = c[0].radio("Tipo", ["Entrada", "Salida"], horizontal=True)
-        monto_txt = campo_dinero(c[1], "Monto $")
-        mo = c[2].selectbox("Moneda", ["$", "Bs"])
-        tasa_txt = campo_dinero(c[3], "Tasa", ayuda="Solo si la ubicación maneja bolívares.")
+        monto_txt = campo_dinero(c[1], f"Monto ({mon_u})")
+        concepto = c[2].text_input("Concepto (opcional)")
         if st.form_submit_button("Aplicar", type="primary"):
-            monto, tasa = leer_monto(monto_txt), leer_monto(tasa_txt)
+            monto = leer_monto(monto_txt)
             if not nombre:
                 st.error("Falta la ubicación.")
-            elif monto is None or tasa is None:
-                st.error("Revisa los números: escribe por ejemplo 12 o 12,55.")
+            elif monto is None:
+                st.error("Revisa el monto: escribe por ejemplo 12 o 12,55.")
             elif monto <= 0:
                 st.error("El monto debe ser mayor que cero.")
             else:
                 cambio = monto if signo == "Entrada" else -monto
                 nuevo_saldo = actual + cambio
-                if nuevo_saldo < 0:
-                    st.error(f"No alcanza: {nombre} tiene {money(actual)} y quieres "
-                             f"sacar {money(monto)}.")
+                if nuevo_saldo < -0.004:
+                    st.error(f"No alcanza: {nombre} tiene {plata(actual, mon_u)} y quieres "
+                             f"sacar {plata(monto, mon_u)}.")
                 else:
                     df = leer("CAJA")
-                    df["MONTO"] = pd.to_numeric(df["MONTO"], errors="coerce").astype(float)
-                    df["TASA"] = pd.to_numeric(df["TASA"], errors="coerce").astype(float)
+                    df["MONTO"] = pd.to_numeric(df["MONTO"], errors="coerce").fillna(0) \
+                        .astype(float)
                     if nombre in set(df["UBICACION"]):
                         df.loc[df["UBICACION"] == nombre, "MONTO"] = nuevo_saldo
-                        df.loc[df["UBICACION"] == nombre, "MONEDA"] = mo
-                        if tasa:
-                            df.loc[df["UBICACION"] == nombre, "TASA"] = tasa
                     else:
                         df = pd.concat([df, pd.DataFrame([{
-                            "UBICACION": nombre, "MONTO": nuevo_saldo, "MONEDA": mo,
-                            "TASA": tasa or None}])], ignore_index=True)
+                            "UBICACION": nombre, "MONTO": nuevo_saldo, "MONEDA": mon_u,
+                            "TASA": None}])], ignore_index=True)
                     guardar("CAJA", df)
-                    st.success(f"{signo} de {money(monto)} en {nombre}. "
-                               f"Queda {money(nuevo_saldo)}.")
+                    st.session_state["ult_caja"] = nombre
+                    avisar(f"{signo} de {plata(monto, mon_u)} en {nombre}"
+                           + (f" ({concepto})" if concepto else "")
+                           + f". Queda {plata(nuevo_saldo, mon_u)}.")
                     st.rerun()
+
+    st.subheader("Transferir entre ubicaciones")
+    if len(ubis) >= 2:
+        with st.form("transferir", clear_on_submit=True):
+            c = st.columns([2, 2, 1])
+            de = c[0].selectbox("Desde", ubis, key="tr_de")
+            a = c[1].selectbox("Hacia", ubis, index=1, key="tr_a")
+            monto_txt = campo_dinero(c[2], "Monto (moneda de origen)")
+            if st.form_submit_button("Transferir", type="primary"):
+                monto = leer_monto(monto_txt)
+                mon_de = CAJA.loc[CAJA["UBICACION"] == de, "MONEDA"].iloc[0]
+                d_de, _, err1 = plan_caja(de, -(monto or 0), mon_de)
+                d_a, mon_a, err2 = plan_caja(a, monto or 0, mon_de)
+                if de == a:
+                    st.error("Elige dos ubicaciones distintas.")
+                elif monto is None or monto <= 0:
+                    st.error("Revisa el monto.")
+                elif err1 or err2:
+                    st.error(err1 or err2)
+                else:
+                    df = leer("CAJA")
+                    df["MONTO"] = pd.to_numeric(df["MONTO"], errors="coerce").fillna(0) \
+                        .astype(float)
+                    df.loc[df["UBICACION"] == de, "MONTO"] += d_de
+                    df.loc[df["UBICACION"] == a, "MONTO"] += d_a
+                    guardar("CAJA", df)
+                    avisar(f"Transferidos {plata(monto, mon_de)} de {de} a {a}"
+                           + (f" (llegan {plata(d_a, mon_a)})" if mon_a != mon_de else "")
+                           + ".")
+                    st.rerun()
+    else:
+        st.caption("Necesitas al menos dos ubicaciones.")
 
     st.divider()
     with st.expander("✏️ Editar saldos directamente"):
-        st.caption("Para corregir un saldo a mano o eliminar una ubicación.")
+        st.caption("Para corregir un saldo a mano, cambiar la moneda o eliminar una ubicación.")
         edit = st.data_editor(caja, num_rows="dynamic", width="stretch", key="ed_caja",
                               column_config={
                                   "MONTO": st.column_config.NumberColumn(format="%.2f"),
                                   "MONEDA": st.column_config.SelectboxColumn(
                                       options=["$", "Bs"]),
-                                  "TASA": st.column_config.NumberColumn(format="%.2f")})
+                                  "TASA": st.column_config.NumberColumn(
+                                      format="%.2f",
+                                      help="Opcional. Se usa solo si no hay tasa del día.")})
         if st.button("💾 Guardar caja", type="primary"):
             guardar("CAJA", edit)
-            st.success("Caja actualizada.")
+            avisar("Caja actualizada.")
             st.rerun()
 
-    con_saldo = caja[caja["MONTO"] > 0]
+    con_saldo = CAJA[CAJA["MONTO_USD"] > 0]
     if len(con_saldo):
         st.plotly_chart(
-            px.pie(con_saldo, values="MONTO", names="UBICACION", hole=0.45),
+            px.pie(con_saldo, values="MONTO_USD", names="UBICACION", hole=0.45,
+                   title="Reparto en dólares"),
             width="stretch",
         )
 

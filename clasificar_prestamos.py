@@ -14,8 +14,8 @@ import pandas as pd
 
 from migrar_sheet import SCOPES, celdas
 
-COLS = ["PERSONA", "TIPO", "DESCRIPCION", "COSTO", "COBRAR", "ABONADO", "FECHA",
-        "NOTA"]
+COLS = ["PERSONA", "TIPO", "DESCRIPCION", "COSTO", "COBRAR", "ABONADO", "MONEDA",
+        "FECHA", "ULT_ABONO", "NOTA"]
 
 
 def main():
@@ -39,7 +39,7 @@ def main():
     for c in COLS:
         if c not in df.columns:
             df[c] = pd.Series([""] * len(df), dtype=object)
-    df = df[COLS].astype(object)
+    df = df[COLS + [c for c in df.columns if c not in COLS]].astype(object)
     df = df[df["PERSONA"].astype(str).str.strip() != ""]
 
     sin_tipo = df["TIPO"].astype(str).str.strip() == ""
