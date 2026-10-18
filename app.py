@@ -32,6 +32,7 @@ TABS = {
     "MOVIMIENTOS": ["FECHA", "UBICACION", "MONTO", "MONEDA", "SALDO", "ORIGEN", "DETALLE"],
     "CONTACTOS": ["PERSONA", "TELEFONO"],
     "LOTES": ["LOTE", "ESTADO", "LLEGADA"],
+    "FOTOS": ["NOMBRE", "IMG"],
     "VENTAS_HIST": ["NOMBRE", "MONTO", "FECHA", "LOTE"],
     "INVENTARIO_HIST": ["NOMBRE", "SKU", "PROPIETARIO", "TALLA", "CANTIDAD", "PRECIO_COMPRA",
                         "PRECIO_VENTA", "TIPO", "CATEGORIA", "LOTE", "FECHA_LOTE"],
@@ -62,6 +63,7 @@ FECHAS = {"VENTAS": ["FECHA"], "ENCARGOS": ["FECHA", "ULT_ABONO"], "GASTOS": ["F
 CLAVES = {"INVENTARIO": "NOMBRE", "VENTAS": "NOMBRE", "DEUDAS": "DEUDOR", "CAJA": "UBICACION",
           "ENCARGOS": "PERSONA", "CONFIG": "CLAVE", "GASTOS": "CATEGORIA",
           "MOVIMIENTOS": "UBICACION", "CONTACTOS": "PERSONA", "LOTES": "LOTE",
+          "FOTOS": "NOMBRE",
           "VENTAS_HIST": "NOMBRE",
           "INVENTARIO_HIST": "NOMBRE"}
 SCOPES = [
@@ -626,6 +628,67 @@ def emparejar(lineas, inv, umbral=0.85):
         lineas[i]["COINCIDE"], lineas[i]["COMO"] = n, f"descripción {r:.0%}"
         tomados.add(n)
     return lineas
+
+
+FOTO_PROPIA = "foto_propia"      # en INVENTARIO.FOTO: la imagen está en la pestaña FOTOS
+MAX_CARACTERES_FOTO = 30000      # cabe en una celda de Sheets (50.000) y de Excel (32.767)
+
+
+def comprimir_foto(contenido):
+    """Imagen subida -> JPEG en base64 que quepa en una celda. None si no es una imagen."""
+    import base64
+    from PIL import Image, ImageOps
+    try:
+        im = ImageOps.exif_transpose(Image.open(io.BytesIO(contenido))).convert("RGB")
+    except Exception:
+        return None
+    for lado in (480, 420, 360, 300):
+        for calidad in (80, 72, 65, 58):
+            c = im.copy()
+            c.thumbnail((lado, lado))
+            buf = io.BytesIO()
+            c.save(buf, "JPEG", quality=calidad, optimize=True)
+            texto = base64.b64encode(buf.getvalue()).decode()
+            if len(texto) <= MAX_CARACTERES_FOTO:
+                return texto
+    return None
+
+
+def imagen_de(foto, nombre, fotos_propias):
+    """Lo que st.image necesita: el enlace, o los bytes de la foto subida."""
+    import base64
+    foto = str(foto or "").strip()
+    if foto.startswith("http"):
+        return foto
+    if foto == FOTO_PROPIA and nombre in fotos_propias:
+        try:
+            return base64.b64decode(fotos_propias[nombre])
+        except Exception:
+            return None
+    return None
+
+
+def tiene_foto(serie):
+    s = serie.astype(str).str.strip()
+    return s.str.startswith("http") | (s == FOTO_PROPIA)
+
+
+def guardar_foto(nombre, foto_inv, img_b64=None):
+    """Asigna la foto de un producto: enlace (foto_inv=https…), propia (img_b64) o ninguna."""
+    if img_b64 is not None:
+        fotos = leer("FOTOS")
+        if nombre in set(fotos["NOMBRE"]):
+            fotos.loc[fotos["NOMBRE"] == nombre, "IMG"] = img_b64
+            guardar("FOTOS", fotos)
+        else:
+            anexar("FOTOS", [{"NOMBRE": nombre, "IMG": img_b64}])
+        foto_inv = FOTO_PROPIA
+    elif nombre in set(leer("FOTOS")["NOMBRE"]):       # enlace o quitar: borrar la propia
+        fotos = leer("FOTOS")
+        guardar("FOTOS", fotos[fotos["NOMBRE"] != nombre])
+    df = leer("INVENTARIO")
+    df.loc[df["NOMBRE"] == nombre, "FOTO"] = foto_inv
+    guardar("INVENTARIO", df)
 
 
 def set_lote(lote, estado, llegada=None):
@@ -1674,15 +1737,14 @@ elif seccion == "📦 Inventario":
                                 m_ = df_inv["NOMBRE"] == r_.COINCIDE_INV
                                 if m_.any() and not str(df_inv.loc[m_, "SKU"].iloc[0]).strip():
                                     df_inv.loc[m_, "SKU"] = r_.SKU
-                                if m_.any() and not str(df_inv.loc[m_, "FOTO"].iloc[0]) \
-                                        .startswith("http"):
+                                if m_.any() and not tiene_foto(df_inv.loc[m_, "FOTO"]).iloc[0]:
                                     df_inv.loc[m_, "FOTO"] = r_.FOTO
                             for r_ in sumar.itertuples():
                                 m_ = df_inv["NOMBRE"] == r_.COINCIDE_INV
                                 df_inv.loc[m_, "CANTIDAD"] += int(r_.CANTIDAD)
                                 if not str(df_inv.loc[m_, "SKU"].iloc[0]).strip():
                                     df_inv.loc[m_, "SKU"] = r_.SKU
-                                if not str(df_inv.loc[m_, "FOTO"].iloc[0]).startswith("http"):
+                                if not tiene_foto(df_inv.loc[m_, "FOTO"]).iloc[0]:
                                     df_inv.loc[m_, "FOTO"] = r_.FOTO
                             filas_n = [{
                                 "DESCRIPCION": f"{r_.DESCRIPCION}"
@@ -1819,6 +1881,65 @@ elif seccion == "📦 Inventario":
         },
     )
 
+    en_venta = INV[(INV["EXISTENCIA"] > 0) & (INV["OCULTAR"].astype(str).str.upper() != "SI")]
+    n_sin_foto = int((~tiene_foto(en_venta["FOTO"])).sum())
+    with st.expander(f"📷 Fotos de productos ({n_sin_foto} en venta sin foto)"):
+        c = st.columns([2, 1])
+        solo_sin = c[0].checkbox("Solo los que no tienen foto", value=n_sin_foto > 0,
+                                 key="fotos_solo_sin")
+        solo_venta = c[1].checkbox("Solo con existencia", value=True, key="fotos_solo_venta")
+        lista_f = en_venta if solo_venta else INV
+        if solo_sin:
+            lista_f = lista_f[~tiene_foto(lista_f["FOTO"])]
+        if lista_f.empty:
+            st.success("Todos los productos de la lista tienen foto.")
+        else:
+            nombres_f = sorted(lista_f["NOMBRE"])
+            prod_f = st.selectbox("Producto", nombres_f, key="fotos_prod")
+            fila_f = INV[INV["NOMBRE"] == prod_f].iloc[0]
+            c = st.columns([1, 2])
+            with c[0]:
+                fotos_propias = (dict(zip(leer("FOTOS")["NOMBRE"], leer("FOTOS")["IMG"]))
+                                 if str(fila_f["FOTO"]).strip() == FOTO_PROPIA else {})
+                img = imagen_de(fila_f["FOTO"], prod_f, fotos_propias)
+                if img is not None:
+                    st.image(img, width=180, caption="Foto actual")
+                else:
+                    st.caption("Sin foto todavía.")
+                if str(fila_f["DESCRIPCION"]).strip():
+                    st.caption(str(fila_f["DESCRIPCION"])[:120])
+            with c[1]:
+                subida = st.file_uploader("Subir imagen (jpg, png o webp)",
+                                          type=["jpg", "jpeg", "png", "webp"],
+                                          key=f"up_foto_{prod_f}")
+                enlace = st.text_input("…o pegar el enlace de la imagen",
+                                       placeholder="https://…", key=f"url_foto_{prod_f}")
+                b1, b2 = st.columns(2)
+                if b1.button("💾 Guardar foto", type="primary", key=f"btn_foto_{prod_f}",
+                             disabled=subida is None and not enlace.strip()):
+                    if subida is not None:
+                        b64 = comprimir_foto(subida.getvalue())
+                        if b64 is None:
+                            st.error("No pude leer ese archivo como imagen.")
+                        else:
+                            guardar_foto(prod_f, None, b64)
+                            avisar(f"Foto de {prod_f} guardada. Sale en el catálogo en unos "
+                                   "minutos.")
+                            st.rerun()
+                    elif not enlace.strip().startswith("http"):
+                        st.error("El enlace debe empezar por https://")
+                    else:
+                        guardar_foto(prod_f, enlace.strip())
+                        avisar(f"Foto de {prod_f} guardada. Sale en el catálogo en unos minutos.")
+                        st.rerun()
+                if tiene_foto(pd.Series([fila_f["FOTO"]])).iloc[0] and \
+                        b2.button("🗑️ Quitar foto", key=f"btn_quitar_foto_{prod_f}"):
+                    guardar_foto(prod_f, "")
+                    avisar(f"Se quitó la foto de {prod_f}.")
+                    st.rerun()
+                st.caption("Desde el teléfono, «Subir imagen» te deja tomar la foto con la "
+                           "cámara. Se reduce sola para que quepa en tu Sheet.")
+
     with st.expander(f"🚚 Lotes en camino ({len(EN_CAMINO)})", expanded=bool(EN_CAMINO)):
         st.caption("Los productos de un lote en camino no salen en el catálogo. Cuando llegue, "
                    "márcalo como recibido y aparecen solos.")
@@ -1854,7 +1975,7 @@ elif seccion == "📦 Inventario":
             st.markdown(f"Tu catálogo: [{url_cat}]({url_cat})")
         visibles = INV[(INV["EXISTENCIA"] > 0) & (INV["PRECIO_VENTA"] > 0) &
                        (INV["OCULTAR"].astype(str).str.upper() != "SI") & (~INV["EN_CAMINO"])]
-        con_foto = visibles["FOTO"].astype(str).str.startswith("http").sum()
+        con_foto = int(tiene_foto(visibles["FOTO"]).sum())
         st.caption(f"Se ven {len(visibles)} productos (con existencia, no ocultos y de lotes "
                    f"que ya llegaron); {con_foto} con foto. Para agregar fotos u ocultar algo, usa las "
                    "columnas FOTO y OCULTAR en «✏️ Editar inventario».")

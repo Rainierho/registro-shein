@@ -46,6 +46,36 @@ def _matriz(valores):
     return pd.DataFrame(filas[1:], columns=cab)
 
 
+FOTO_PROPIA = "foto_propia"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cargar_fotos(backend, id_hoja):
+    """Fotos subidas desde la app (pestaña FOTOS): {NOMBRE: bytes}. Solo se lee si hace falta."""
+    import base64
+    df = pd.DataFrame()
+    try:
+        if backend == "gsheets":
+            import gspread
+            from google.oauth2.service_account import Credentials
+            creds = Credentials.from_service_account_info(
+                dict(st.secrets["gcp_service_account"]), scopes=SCOPES)
+            libro = gspread.authorize(creds).open_by_key(id_hoja)
+            df = _matriz(libro.worksheet("FOTOS").get_values(value_render_option="UNFORMATTED_VALUE"))
+        else:
+            df = pd.read_excel(id_hoja, sheet_name="FOTOS")
+            df.columns = [str(c).strip().upper() for c in df.columns]
+    except Exception:
+        return {}
+    salida = {}
+    for n, img in zip(df.get("NOMBRE", []), df.get("IMG", [])):
+        try:
+            salida[str(n).strip()] = base64.b64decode(str(img))
+        except Exception:
+            pass
+    return salida
+
+
 @st.cache_data(ttl=300, show_spinner="Cargando catálogo...")
 def cargar(backend, id_hoja):
     """La caché depende de qué hoja se lee: si cambias los Secrets, no reusa lo viejo."""
@@ -173,6 +203,8 @@ disp = inv[(inv["QUEDAN"] > 0) & (inv["PRECIO"].fillna(0) > 0)
            & (~inv["LOTE_N"].isin(en_camino))
            & (inv["OCULTAR"].astype(str).str.strip().str.upper() != "SI")].copy()
 disp["TIPO"] = disp["NOMBRE"].str.split().str[0].str.capitalize()
+FOTOS_PROPIAS = (cargar_fotos(BACKEND, secreto("spreadsheet_id") or secreto("excel_path", ""))
+                 if (disp["FOTO"].astype(str).str.strip() == FOTO_PROPIA).any() else {})
 
 st.title(f"🛍️ {NOMBRE}")
 if WHATSAPP:
@@ -206,7 +238,8 @@ elif orden == "Mayor precio":
 elif orden == "Nombre":
     v = v.sort_values("NOMBRE")
 else:   # primero los que tienen foto, luego los que quedan pocos
-    v = v.assign(_f=~v["FOTO"].astype(str).str.startswith("http")).sort_values(["_f", "QUEDAN"])
+    con_f = v["FOTO"].astype(str).str.startswith("http") | (v["FOTO"].astype(str) == FOTO_PROPIA)
+    v = v.assign(_f=~con_f).sort_values(["_f", "QUEDAN"])
 
 if v.empty:
     st.info("No hay productos con esa búsqueda.")
@@ -221,6 +254,8 @@ for grupo in filas:
             foto = str(p["FOTO"]).strip()
             if foto.startswith("http"):
                 st.image(foto, width="stretch")
+            elif foto == FOTO_PROPIA and p["NOMBRE"] in FOTOS_PROPIAS:
+                st.image(FOTOS_PROPIAS[p["NOMBRE"]], width="stretch")
             st.markdown(f"**{p['NOMBRE'].title()}**")
             desc = str(p["DESCRIPCION"]).strip()
             if desc:
