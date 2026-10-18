@@ -494,7 +494,8 @@ SUSTANTIVOS = {
     "medias": ("MEDIAS", 2.0), "zapatos": ("ZAPATOS", 12.0), "zapatillas": ("ZAPATOS", 12.0),
     "tenis": ("ZAPATOS", 12.0), "sandalias": ("SANDALIAS", 8.0), "botas": ("BOTAS", 15.0),
     "perro": ("ROPA MASCOTA", 5.0), "perros": ("ROPA MASCOTA", 5.0), "mascota": ("ROPA MASCOTA", 5.0),
-    "outfit": ("CONJUNTO", 12.0),
+    "outfit": ("CONJUNTO", 12.0), "perfume": ("PERFUME", 8.0), "colonia": ("PERFUME", 8.0),
+    "billetera": ("CARTERA", 5.0), "monedero": ("CARTERA", 4.0),
 }
 
 
@@ -691,6 +692,40 @@ def guardar_foto(nombre, foto_inv, img_b64=None):
     guardar("INVENTARIO", df)
 
 
+def sugerir_precargados(lineas, inv, lotes_recientes):
+    """Productos que cargaste a mano antes de importar: no tienen código ni foto de SHEIN y su
+    descripción es tuya. Se proponen los del lote reciente (o en camino) que sean del mismo tipo
+    y tengan la misma cantidad o un nombre parecido. Quedan para que tú los confirmes."""
+    cand = inv[inv["LOTE"].isin(lotes_recientes)
+               & ~(inv["SKU"].astype(str).str.strip() != "")]
+    tomados = {l_["COINCIDE"] for l_ in lineas if l_["COINCIDE"]}
+    puntajes = []
+    for i, l_ in enumerate(lineas):
+        if l_["COINCIDE"]:
+            continue
+        _, w, palabras = _sustantivo(l_["DESCRIPCION"])
+        tipo_l = tipo_de(w) if w else None
+        if not tipo_l:
+            continue
+        pal_l = {_norm(x) for x in palabras if len(x) > 2 and _norm(x) not in PALABRAS_VACIAS}
+        for r in cand.itertuples():
+            if _tipo(str(r.NOMBRE).split()[0]) != tipo_l:
+                continue
+            texto = f"{r.NOMBRE} {r.DESCRIPCION}"
+            pal_r = {_norm(x) for x in re.findall(r"[A-Za-zÁÉÍÓÚÑÜáéíóúñü]+", texto)
+                     if len(x) > 2 and _norm(x) not in PALABRAS_VACIAS}
+            jac = len(pal_l & pal_r) / len(pal_l | pal_r) if pal_l | pal_r else 0.0
+            misma_cant = _ent(r.CANTIDAD) == _ent(l_["CANTIDAD"])
+            if misma_cant or jac >= 0.25:
+                puntajes.append((misma_cant + jac, i, r.NOMBRE))
+    for pt, i, n in sorted(puntajes, reverse=True):
+        if lineas[i]["COINCIDE"] or n in tomados:
+            continue
+        lineas[i]["COINCIDE"], lineas[i]["COMO"] = n, "precargado, revísalo"
+        tomados.add(n)
+    return lineas
+
+
 def set_lote(lote, estado, llegada=None):
     """Marca un lote como EN CAMINO o RECIBIDO (con su fecha de llegada)."""
     df = leer("LOTES")
@@ -783,7 +818,9 @@ def gastos_calculados(g, tasa=None):
 
 
 CATEGORIAS_GASTO = ["ENVÍO", "EMPAQUE", "DELIVERY", "OTRO"]
-DESTINOS = ["🛍️ Inventario", "🎁 Encargo", "— No importar"]
+D_INV, D_SUMAR, D_ENC, D_NO = ("🛍️ Inventario", "➕ Sumar al que ya está", "🎁 Encargo",
+                                "— No importar")
+DESTINOS = [D_INV, D_SUMAR, D_ENC, D_NO]
 
 
 def caja_calculada(caja, tasa=None):
@@ -1592,6 +1629,14 @@ elif seccion == "📦 Inventario":
                             l_["PEDIDO"] = p_["numero"]
                         lineas.extend(ls)
                     emparejar(lineas, INV)
+                    max_lote = INV["LOTE"].max() if len(INV) else None
+                    recientes = set(EN_CAMINO) | ({max_lote} if pd.notna(max_lote) else set())
+                    sugerir_precargados(lineas, INV, recientes)
+                    lote_de = INV.set_index("NOMBRE")["LOTE"].to_dict()
+                    lotes_prec = [lote_de.get(l_["COINCIDE"]) for l_ in lineas
+                                  if l_["COMO"] == "precargado, revísalo"]
+                    lote_sugerido = (int(pd.Series(lotes_prec).mode().iloc[0]) if lotes_prec
+                                     else _ent(max_lote or 0) + 1)
                     usados = set(INV["NOMBRE"])
                     filas_imp = []
                     for l_ in lineas:
@@ -1602,29 +1647,33 @@ elif seccion == "📦 Inventario":
                                 nom, k_ = f"{base_n} {k_}", k_ + 1
                             usados.add(nom)
                         filas_imp.append({
-                            "DESTINO": DESTINOS[2] if l_["COINCIDE"] else DESTINOS[0],
+                            "DESTINO": D_NO if l_["COINCIDE"] else D_INV,
                             "PARA": "",
+                            "YA_ESTA": l_["COINCIDE"] or "",
                             "FOTO": l_["FOTO"],
                             "NOMBRE": nom,
                             "CANTIDAD": int(l_["CANTIDAD"]),
                             "COSTO": round(l_["COSTO"], 2),
                             "PRECIO_VENTA": (precio_sugerido(l_["COSTO"], mult, escalera)
                                              if modo_precio == "Sugerido por margen" else None),
-                            "ESTADO": (f"✅ ya está como {l_['COINCIDE']} ({l_['COMO']})"
-                                       if l_["COINCIDE"] else "🆕 nuevo"),
+                            "ESTADO": ("🔎 " + l_["COMO"] if l_["COMO"] == "precargado, revísalo"
+                                       else (f"✅ por {l_['COMO']}" if l_["COINCIDE"]
+                                             else "🆕 nuevo")),
                             "DESCRIPCION": l_["DESCRIPCION"],
                             "ATRIBUTO": l_["ATRIBUTO"],
                             "SKU": l_["SKU"],
                             "PEDIDO": l_["PEDIDO"],
-                            "COINCIDE_INV": l_["COINCIDE"] or "",
                         })
                     tabla = pd.DataFrame(filas_imp)
                     tabla["PRECIO_VENTA"] = pd.to_numeric(tabla["PRECIO_VENTA"], errors="coerce")
-                    n_ya = int((tabla["COINCIDE_INV"] != "").sum())
+                    n_ya = int((tabla["YA_ESTA"] != "").sum())
+                    n_prec = int((tabla["ESTADO"] == "🔎 precargado, revísalo").sum())
                     st.caption(
                         f"{len(tabla)} productos, {int(tabla['CANTIDAD'].sum())} unidades"
                         + (f" · {n_ya} ya están en tu inventario y vienen en «No importar»"
                            if n_ya else "")
+                        + (f" ({n_prec} son una suposición: los marqué con 🔎, revísalos)"
+                           if n_prec else "")
                         + ". " + ("Costos exactos según el precio de cada producto." if exacto
                                   else "La página no trae el precio de cada producto: el costo "
                                        "se estimó según lo que te suele costar cada tipo, y la "
@@ -1636,14 +1685,22 @@ elif seccion == "📦 Inventario":
                         if len(ENC) else []
                     ed_imp = st.data_editor(
                         tabla, key=clave_ed, hide_index=True, width="stretch", height=430,
-                        column_order=["DESTINO", "PARA", "FOTO", "NOMBRE", "CANTIDAD", "COSTO",
-                                      "PRECIO_VENTA", "ESTADO", "DESCRIPCION", "ATRIBUTO"],
+                        column_order=["DESTINO", "PARA", "YA_ESTA", "FOTO", "NOMBRE", "CANTIDAD",
+                                      "COSTO", "PRECIO_VENTA", "ESTADO", "DESCRIPCION",
+                                      "ATRIBUTO"],
                         disabled=["FOTO", "ESTADO", "DESCRIPCION", "ATRIBUTO"],
                         column_config={
                             "DESTINO": st.column_config.SelectboxColumn(
-                                "Destino", options=DESTINOS, required=True, width="small"),
+                                "Destino ▾", options=DESTINOS, required=True, width="medium",
+                                help="Doble clic para elegir: Inventario, Sumar al que ya está, "
+                                     "Encargo o No importar."),
+                            "YA_ESTA": st.column_config.SelectboxColumn(
+                                "Ya está como ▾", options=[""] + sorted(INV["NOMBRE"]),
+                                width="medium",
+                                help="Si este producto ya lo cargaste, elige cuál es. Luego "
+                                     "pon el destino en «No importar» o «Sumar al que ya está»."),
                             "PARA": st.column_config.TextColumn(
-                                "Encargo para", width="small",
+                                "Encargo para", width="medium",
                                 help="Solo si el destino es Encargo. Personas conocidas: "
                                      + (", ".join(personas_conocidas[:15]) or "ninguna aún")),
                             "FOTO": st.column_config.ImageColumn("Foto", width="small"),
@@ -1659,18 +1716,24 @@ elif seccion == "📦 Inventario":
                             "ESTADO": st.column_config.TextColumn("Estado", width="medium"),
                             "DESCRIPCION": st.column_config.TextColumn("Descripción SHEIN"),
                         })
-                    a_inv = ed_imp[ed_imp["DESTINO"] == DESTINOS[0]]
-                    a_enc = ed_imp[ed_imp["DESTINO"] == DESTINOS[1]]
-                    usar = pd.concat([a_inv, a_enc])
+                    ed_imp["YA_ESTA"] = ed_imp["YA_ESTA"].fillna("").astype(str).str.strip()
+                    a_inv = ed_imp[ed_imp["DESTINO"] == D_INV]
+                    a_sum = ed_imp[ed_imp["DESTINO"] == D_SUMAR]
+                    a_enc = ed_imp[ed_imp["DESTINO"] == D_ENC]
+                    usar = pd.concat([a_inv, a_sum, a_enc])
                     costo_sel = float((usar["COSTO"] * usar["CANTIDAD"]).sum())
-                    st.caption("**Inventario** entra a tu stock y al catálogo. **Encargo** crea la "
-                               "cuenta en Por cobrar para esa persona (no sale en el catálogo). "
-                               "Si mandas a Inventario uno que ya está, su cantidad se **suma** "
-                               "a ese producto; cambia «Cant.» para sumar solo las que faltan.")
+                    st.caption("**Destino** (doble clic en la celda): **Inventario** crea un "
+                               "producto nuevo. **Sumar al que ya está** agrega la cantidad al "
+                               "que elegiste en «Ya está como» (cambia «Cant.» para sumar solo "
+                               "las que faltan). **Encargo** crea la cuenta en Por cobrar para la "
+                               "persona de «Encargo para» y no sale en el catálogo. **No "
+                               "importar** lo deja fuera.")
                     n_pers = a_enc["PARA"].astype(str).str.strip().replace("", pd.NA).nunique()
                     st.markdown(
-                        f"**A importar:** {len(a_inv)} productos al inventario "
+                        f"**A importar:** {len(a_inv)} productos nuevos "
                         f"({int(a_inv['CANTIDAD'].sum())} u.)"
+                        + (f" · {len(a_sum)} suman a existentes ({int(a_sum['CANTIDAD'].sum())} u.)"
+                           if len(a_sum) else "")
                         + (f" · {len(a_enc)} en encargos para {n_pers} persona(s)"
                            if len(a_enc) else "")
                         + f" · costo {money(costo_sel)}")
@@ -1684,11 +1747,18 @@ elif seccion == "📦 Inventario":
                     c = st.columns([1, 1, 2])
                     lote_imp = c[0].number_input(
                         "Lote", min_value=1, step=1,
-                        value=_ent(INV["LOTE"].max() if len(INV) else 0) + 1, key="lote_imp")
+                        value=lote_sugerido, key="lote_imp",
+                        help="Si precargaste parte de este pedido, viene el lote de esos productos.")
                     no_llego = c[1].checkbox("Todavía no ha llegado", value=True,
                                              key="imp_en_camino")
                     ubic_imp = selector_caja(c[2], "¿De dónde salió el pago?", "caja_imp",
                                              mover_por_defecto=False)
+                    n_no = int(((ed_imp["DESTINO"] == D_NO) & (ed_imp["YA_ESTA"] != "")).sum())
+                    st.caption(f"Si eliges de dónde salió el pago, se descuenta {money(costo_sel)}: "
+                               "lo que importas ahora."
+                               + (f" Los {n_no} que ya tenías cargados no se vuelven a descontar; "
+                                  "si nunca registraste su pago, haz una salida en Caja Chica."
+                                  if n_no else ""))
                     envio_gasto = False
                     if envio_total > 0:
                         envio_gasto = st.checkbox(
@@ -1696,8 +1766,9 @@ elif seccion == "📦 Inventario":
                             f"{lote_imp})", value=True, key="imp_envio")
                     if st.button(f"📥 Importar {len(usar)} productos", type="primary",
                                  disabled=usar.empty, key="btn_importar"):
-                        nuevos = a_inv[a_inv["COINCIDE_INV"] == ""]
-                        sumar = a_inv[a_inv["COINCIDE_INV"] != ""]
+                        nuevos, sumar = a_inv, a_sum
+                        mal_inv = a_inv[a_inv["YA_ESTA"] != ""]
+                        mal_sum = a_sum[a_sum["YA_ESTA"] == ""]
                         nombres = nuevos["NOMBRE"].fillna("").astype(str).str.strip().str.upper()
                         repetidos = sorted(set(nombres[nombres.duplicated()]) |
                                            (set(nombres) & set(INV["NOMBRE"])))
@@ -1708,7 +1779,16 @@ elif seccion == "📦 Inventario":
                                                           errors="coerce") > 0)]
                         sale = costo_sel + (envio_total if envio_gasto else 0.0)
                         delta, _, err = plan_caja(ubic_imp, -sale)
-                        if (nombres == "").any():
+                        if len(mal_inv):
+                            st.error("Estos están marcados como que ya los tienes, pero van a "
+                                     "Inventario (se duplicarían): "
+                                     + ", ".join(mal_inv["YA_ESTA"].astype(str)[:6]) + ". Ponles "
+                                     "«No importar» o «Sumar al que ya está», o borra «Ya está "
+                                     "como» si en realidad son nuevos.")
+                        elif len(mal_sum):
+                            st.error(f"{len(mal_sum)} productos van a «Sumar al que ya está» pero "
+                                     "no dicen a cuál: elígelo en «Ya está como».")
+                        elif (nombres == "").any():
                             st.error("Hay productos para inventario sin nombre corto.")
                         elif repetidos:
                             st.error("Estos nombres ya existen o se repiten: "
@@ -1732,15 +1812,15 @@ elif seccion == "📦 Inventario":
                                                                errors="coerce").fillna(0)
                             # los "No importar" que ya estaban son el mismo producto:
                             # se les guarda el código y la foto para reconocerlos la próxima vez
-                            for r_ in ed_imp[(ed_imp["DESTINO"] == DESTINOS[2]) &
-                                             (ed_imp["COINCIDE_INV"] != "")].itertuples():
-                                m_ = df_inv["NOMBRE"] == r_.COINCIDE_INV
+                            for r_ in ed_imp[(ed_imp["DESTINO"] == D_NO) &
+                                             (ed_imp["YA_ESTA"] != "")].itertuples():
+                                m_ = df_inv["NOMBRE"] == r_.YA_ESTA
                                 if m_.any() and not str(df_inv.loc[m_, "SKU"].iloc[0]).strip():
                                     df_inv.loc[m_, "SKU"] = r_.SKU
                                 if m_.any() and not tiene_foto(df_inv.loc[m_, "FOTO"]).iloc[0]:
                                     df_inv.loc[m_, "FOTO"] = r_.FOTO
                             for r_ in sumar.itertuples():
-                                m_ = df_inv["NOMBRE"] == r_.COINCIDE_INV
+                                m_ = df_inv["NOMBRE"] == r_.YA_ESTA
                                 df_inv.loc[m_, "CANTIDAD"] += int(r_.CANTIDAD)
                                 if not str(df_inv.loc[m_, "SKU"].iloc[0]).strip():
                                     df_inv.loc[m_, "SKU"] = r_.SKU
@@ -1754,7 +1834,7 @@ elif seccion == "📦 Inventario":
                                 "PRECIO_VENTA": float(r_.PRECIO_VENTA), "LOTE": int(lote_imp),
                                 "FOTO": r_.FOTO, "OCULTAR": "", "SKU": r_.SKU,
                             } for r_ in nuevos.itertuples()]
-                            if len(filas_n) or len(sumar) or (ed_imp["COINCIDE_INV"] != "").any():
+                            if len(filas_n) or len(sumar) or (ed_imp["YA_ESTA"] != "").any():
                                 guardar("INVENTARIO", pd.concat([df_inv, pd.DataFrame(filas_n)],
                                                                 ignore_index=True))
                             # encargos: una cuenta por producto, a nombre de la persona
