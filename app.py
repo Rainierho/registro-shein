@@ -42,6 +42,9 @@ NUMERICAS = {
     "VENTAS_HIST": ["MONTO", "LOTE"],
     "INVENTARIO_HIST": ["CANTIDAD", "PRECIO_COMPRA", "PRECIO_VENTA", "LOTE"],
 }
+# columnas de plata: siempre float, para que el editor acepte decimales
+DINERO = {"MONTO", "PRECIO_COMPRA", "PRECIO_VENTA", "BOLOS", "TASA", "COSTO", "COBRAR",
+          "ABONADO"}
 FECHAS = {"VENTAS": ["FECHA"], "ENCARGOS": ["FECHA"], "VENTAS_HIST": ["FECHA"],
           "INVENTARIO_HIST": ["FECHA_LOTE"]}
 CLAVES = {"INVENTARIO": "NOMBRE", "VENTAS": "NOMBRE", "DEUDAS": "DEUDOR", "CAJA": "UBICACION",
@@ -141,6 +144,8 @@ def _normalizar(df, tab):
     df = df[cols].copy()
     for c in NUMERICAS.get(tab, []):
         df[c] = _a_numero(df[c])
+        if c in DINERO:
+            df[c] = df[c].astype("float64")
     for c in FECHAS.get(tab, []):
         df[c] = _a_fecha(df[c])
     for c in cols:
@@ -283,8 +288,55 @@ def encargos_calculados(enc):
     return enc
 
 
+def _num(v, default=0.0):
+    """Número seguro: NaN, None, vacío o texto inválido -> default."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return default if pd.isna(f) else f
+
+
+def _ent(v, default=0):
+    return int(round(_num(v, default)))
+
+
 def money(x):
-    return f"${x:,.2f}"
+    x = _num(x, None)
+    return "—" if x is None else f"${x:,.2f}"
+
+
+def leer_monto(texto):
+    """Texto del usuario -> float. Acepta 10,32 · 10.32 · 1.234,56 · $5. Vacío = 0.
+    Devuelve None si no es un número."""
+    t = str(texto or "").strip().replace("$", "").replace(" ", "").replace("Bs", "")
+    if t == "":
+        return 0.0
+    if not all(ch.isdigit() or ch in ".,-" for ch in t):
+        return None
+    if "," in t and "." in t:
+        if t.rfind(",") > t.rfind("."):
+            t = t.replace(".", "").replace(",", ".")
+        else:
+            t = t.replace(",", "")
+    elif "," in t:
+        t = t.replace(",", ".")
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def fmt_monto(v):
+    """Valor inicial de un campo de dinero, con coma decimal."""
+    v = _num(v)
+    return "" if v == 0 else f"{v:.2f}".replace(".", ",")
+
+
+def campo_dinero(contenedor, etiqueta, valor=0.0, key=None, ayuda=None):
+    """Campo de texto para montos: no depende del teclado decimal del navegador."""
+    return contenedor.text_input(etiqueta, value=fmt_monto(valor), placeholder="0,00",
+                                 key=key, help=ayuda)
 
 
 # --------------------------------------------------------------------------
@@ -365,9 +417,12 @@ if seccion == "📊 Dashboard":
     lotes = sorted(set(INV["LOTE"].dropna()) | set(base["LOTE"].dropna()))
     c1, c2 = st.columns([2, 3])
     with c1:
+        f_min, f_max = base["FECHA"].min(), base["FECHA"].max()
+        hoy = dt.date.today()
         rango = st.date_input(
             "Rango de fechas",
-            value=(base["FECHA"].min().date(), base["FECHA"].max().date()),
+            value=(f_min.date() if pd.notna(f_min) else hoy,
+                   f_max.date() if pd.notna(f_max) else hoy),
             format="DD/MM/YYYY",
             key=f"rango_{incluir}",
         )
@@ -564,13 +619,15 @@ elif seccion == "🧾 Ventas":
             with st.form("venta_libre", clear_on_submit=True):
                 c = st.columns([3, 1, 1, 1])
                 nombre = c[0].text_input("Producto").strip().upper()
-                monto = c[1].number_input("Monto $", min_value=0.0, step=0.01,
-                                          format="%.2f", value=5.0)
+                monto_txt = campo_dinero(c[1], "Monto $", 5.0)
                 fecha = c[2].date_input("Fecha", value=dt.date.today(), format="DD/MM/YYYY")
                 lote = c[3].number_input("Lote", min_value=0, step=1, value=0)
                 if st.form_submit_button("Guardar venta", type="primary"):
+                    monto = leer_monto(monto_txt)
                     if not nombre:
                         st.error("Falta el nombre del producto.")
+                    elif monto is None or monto <= 0:
+                        st.error(f"Monto inválido: «{monto_txt}». Escribe por ejemplo 5 o 5,50.")
                     else:
                         agregar("VENTAS", {"NOMBRE": nombre, "MONTO": monto,
                                            "FECHA": pd.Timestamp(fecha), "LOTE": lote or None})
@@ -580,7 +637,7 @@ elif seccion == "🧾 Ventas":
             st.warning("No hay productos con existencia. Carga inventario o usa producto libre.")
         else:
             etiquetas = {
-                f"{r.NOMBRE}  ·  stock {int(r.EXISTENCIA)}  ·  {money(r.PRECIO_VENTA)}": r.NOMBRE
+                f"{r.NOMBRE}  ·  stock {_ent(r.EXISTENCIA)}  ·  {money(r.PRECIO_VENTA)}": r.NOMBRE
                 for r in disponibles.itertuples()
             }
             sel = st.selectbox("Producto", list(etiquetas.keys()))
@@ -588,14 +645,17 @@ elif seccion == "🧾 Ventas":
             prod = disponibles[disponibles["NOMBRE"] == nombre].iloc[0]
             with st.form("venta", clear_on_submit=False):
                 c = st.columns([1, 1, 1, 1])
-                monto = c[0].number_input("Monto $", min_value=0.0, step=0.01,
-                                          format="%.2f",
-                                          value=float(prod["PRECIO_VENTA"] or 0))
+                monto_txt = campo_dinero(c[0], "Monto $", prod["PRECIO_VENTA"],
+                                         key=f"monto_venta_{nombre}")
                 fecha = c[1].date_input("Fecha", value=dt.date.today(), format="DD/MM/YYYY")
                 lote = c[2].number_input("Lote", min_value=0, step=1,
-                                         value=int(prod["LOTE"] or 0))
+                                         value=_ent(prod["LOTE"]), key=f"lote_venta_{nombre}")
                 cantidad = c[3].number_input("Unidades", min_value=1, step=1, value=1)
-                if st.form_submit_button("Guardar venta", type="primary"):
+                enviado = st.form_submit_button("Guardar venta", type="primary")
+                monto = leer_monto(monto_txt)
+                if enviado and (monto is None or monto <= 0):
+                    st.error(f"Monto inválido: «{monto_txt}». Escribe por ejemplo 5 o 5,50.")
+                elif enviado:
                     df = leer("VENTAS")
                     nuevas = pd.DataFrame([{
                         "NOMBRE": nombre, "MONTO": monto,
@@ -639,6 +699,24 @@ elif seccion == "🧾 Ventas":
         },
     )
 
+    with st.expander("🗑️ Eliminar una venta"):
+        st.caption("Para borrar una venta que registraste dos veces o por error. Las más "
+                   "recientes salen primero; escribe en la lista para buscar.")
+        lista = ven_raw.sort_values("FECHA", ascending=False, na_position="last")
+        ops = {}
+        for n, r in enumerate(lista.itertuples(), 1):
+            fecha = f"{r.FECHA:%d/%m/%Y}" if pd.notna(r.FECHA) else "sin fecha"
+            lote = f" · lote {_ent(r.LOTE)}" if pd.notna(r.LOTE) else ""
+            ops[f"#{n} · {fecha} · {r.NOMBRE} · {money(r.MONTO)}{lote}"] = r.Index
+        if ops:
+            elegida = st.selectbox("Venta a eliminar", list(ops.keys()), key="borrar_ven")
+            conf = st.checkbox("Sí, quiero borrar esta venta", key="conf_borrar_ven")
+            if st.button("🗑️ Eliminar venta", disabled=not conf, key="btn_borrar_ven"):
+                df = leer("VENTAS")
+                guardar("VENTAS", df.drop(index=ops[elegida]))
+                st.success("Venta eliminada. La existencia del producto se recalcula sola.")
+                st.rerun()
+
     with st.expander("✏️ Editar / eliminar histórico de ventas"):
         st.caption("Edita celdas, agrega filas o marca filas y presiona Supr para borrar.")
         edit = st.data_editor(
@@ -668,14 +746,15 @@ elif seccion == "📦 Inventario":
             nombre = c[1].text_input("Nombre corto (clave única)").strip().upper()
             c = st.columns(4)
             cant = c[0].number_input("Cantidad", min_value=1, step=1, value=1)
-            pc = c[1].number_input("Precio compra $", min_value=0.0, step=0.01,
-                                   format="%.2f", value=1.0)
-            pv = c[2].number_input("Precio venta $", min_value=0.0, step=0.01,
-                                   format="%.2f", value=5.0)
+            pc_txt = campo_dinero(c[1], "Precio compra $", 1.0)
+            pv_txt = campo_dinero(c[2], "Precio venta $", 5.0)
             lote = c[3].number_input("Lote", min_value=0, step=1,
-                                     value=int(INV["LOTE"].max() or 0))
+                                     value=_ent(INV["LOTE"].max() if len(INV) else 0))
             if st.form_submit_button("Agregar", type="primary"):
-                if not nombre:
+                pc, pv = leer_monto(pc_txt), leer_monto(pv_txt)
+                if pc is None or pv is None:
+                    st.error("Revisa los precios: escribe por ejemplo 1,77 o 5.")
+                elif not nombre:
                     st.error("El nombre corto es obligatorio.")
                 elif nombre in set(inv_raw["NOMBRE"]):
                     st.error("Ese nombre ya existe: usaría el mismo contador de ventas.")
@@ -791,40 +870,45 @@ elif seccion == "🎁 Por cobrar":
         destino = "TODAS"
         if len(cuentas) > 1:
             ops = {"Repartir entre sus cuentas, de la más antigua primero": "TODAS"}
-            for r in cuentas.itertuples():
-                ops[f"Solo: {r.TIPO.lower()}"
+            for n, r in enumerate(cuentas.itertuples(), 1):
+                fecha = f" · {r.FECHA:%d/%m/%Y}" if pd.notna(r.FECHA) else ""
+                ops[f"Cuenta {n}: {r.TIPO.lower()}"
                     + (f" · {r.DESCRIPCION}" if r.DESCRIPCION else "")
-                    + f" · debe {money(r.SALDO)}"] = r.Index
+                    + fecha + f" · debe {money(r.SALDO)}"] = r.Index
             destino = ops[st.selectbox("Aplicar a", list(ops.keys()))]
 
-        saldo = (float(cuentas["SALDO"].sum()) if destino == "TODAS"
-                 else float(ENC.loc[destino, "SALDO"]))
+        saldo = (_num(cuentas["SALDO"].sum()) if destino == "TODAS"
+                 else _num(ENC.loc[destino, "SALDO"]))
 
         with st.form("abono", clear_on_submit=True):
             c = st.columns([2, 1, 2])
-            monto = c[0].number_input("Abono $", min_value=0.0, max_value=saldo,
-                                      step=0.01, format="%.2f", value=0.0,
-                                      help=f"Debe {money(saldo)}. Marca 'Saldó todo' "
+            monto_txt = campo_dinero(c[0], "Abono $",
+                                     ayuda=f"Debe {money(saldo)}. Marca 'Saldó todo' "
                                            "si te pagó completo.")
             todo = c[1].checkbox("Saldó todo")
             if c[2].form_submit_button("Registrar abono", type="primary"):
+                monto = leer_monto(monto_txt)
                 pago = saldo if todo else monto
-                if pago <= 0:
+                if pago is None:
+                    st.error(f"Monto inválido: «{monto_txt}». Escribe por ejemplo 10 o 10,50.")
+                elif pago <= 0:
                     st.error("El abono debe ser mayor que cero.")
+                elif pago > saldo + 0.004:
+                    st.error(f"Te está abonando {money(pago)} pero solo debe {money(saldo)}.")
                 else:
                     df = leer("ENCARGOS")
-                    df["ABONADO"] = pd.to_numeric(df["ABONADO"], errors="coerce").astype(float)
+                    df["ABONADO"] = pd.to_numeric(df["ABONADO"], errors="coerce") \
+                        .fillna(0).astype(float)
                     if destino == "TODAS":
                         resto = pago
                         for idx in cuentas.index:
                             if resto <= 0.004:
                                 break
-                            aplica = min(resto, float(ENC.loc[idx, "SALDO"]))
-                            df.loc[idx, "ABONADO"] = float(df.loc[idx, "ABONADO"] or 0) + aplica
+                            aplica = min(resto, _num(ENC.loc[idx, "SALDO"]))
+                            df.loc[idx, "ABONADO"] = _num(df.loc[idx, "ABONADO"]) + aplica
                             resto -= aplica
                     else:
-                        df.loc[destino, "ABONADO"] = (
-                            float(df.loc[destino, "ABONADO"] or 0) + pago)
+                        df.loc[destino, "ABONADO"] = _num(df.loc[destino, "ABONADO"]) + pago
                     guardar("ENCARGOS", df)
                     resta = saldo - pago
                     st.success(f"Abono de {money(pago)} de {quien}. "
@@ -845,27 +929,32 @@ elif seccion == "🎁 Por cobrar":
                                       key=f"nueva_persona_{tipo}").strip().upper()
         else:
             persona = elegida
-            deuda = ENC[(ENC["PERSONA"] == persona) & (~ENC["ESTA_PAGADO"])]["SALDO"].sum()
-            if deuda:
-                c[1].caption(f"Ya debe {money(deuda)} en {len(ENC[(ENC['PERSONA'] == persona) & (~ENC['ESTA_PAGADO'])])} cuenta(s).")
+            abiertas = ENC[(ENC["PERSONA"] == persona) & (~ENC["ESTA_PAGADO"])]
+            if len(abiertas):
+                c[1].caption(f"Ya debe {money(abiertas['SALDO'].sum())} "
+                             f"en {len(abiertas)} cuenta(s).")
 
         if tipo == "Encargo":
             with st.form("nuevo_encargo", clear_on_submit=True):
                 desc = st.text_input("Qué pidió")
                 c = st.columns(4)
-                costo = c[0].number_input("Costo $ (lo que gastaste)", min_value=0.0,
-                                          step=0.01, format="%.2f")
-                cobrar = c[1].number_input("Cobrar $", min_value=0.0, step=0.01,
-                                           format="%.2f")
-                abonado = c[2].number_input("Ya abonó $", min_value=0.0, step=0.01,
-                                            format="%.2f")
+                costo_txt = campo_dinero(c[0], "Costo $ (lo que gastaste)")
+                cobrar_txt = campo_dinero(c[1], "Cobrar $")
+                abonado_txt = campo_dinero(c[2], "Ya abonó $")
                 fecha = c[3].date_input("Fecha", value=dt.date.today(), format="DD/MM/YYYY")
                 nota = st.text_input("Nota")
                 if st.form_submit_button("Guardar encargo", type="primary"):
+                    costo = leer_monto(costo_txt)
+                    cobrar = leer_monto(cobrar_txt)
+                    abonado = leer_monto(abonado_txt)
                     if not persona:
                         st.error("Falta la persona.")
+                    elif None in (costo, cobrar, abonado):
+                        st.error("Revisa los montos: escribe por ejemplo 40 o 40,50.")
                     elif cobrar <= 0:
                         st.error("Falta el monto a cobrar.")
+                    elif abonado > cobrar + 0.004:
+                        st.error("Lo abonado no puede pasar de lo que se cobra.")
                     else:
                         agregar("ENCARGOS", {
                             "PERSONA": persona, "TIPO": "ENCARGO", "DESCRIPCION": desc,
@@ -878,32 +967,37 @@ elif seccion == "🎁 Por cobrar":
         else:
             with st.form("nuevo_prestamo", clear_on_submit=True):
                 c = st.columns(2)
-                prestado = c[0].number_input("Monto prestado $", min_value=0.0,
-                                             step=0.01, format="%.2f")
-                cobrar = c[1].number_input("A cobrar $", min_value=0.0, step=0.01,
-                                           format="%.2f",
-                                           help="Igual al prestado si no cobras interés.")
+                prestado_txt = campo_dinero(c[0], "Monto prestado $")
+                cobrar_txt = campo_dinero(c[1], "A cobrar $",
+                                          ayuda="Déjalo vacío si no cobras interés.")
                 c = st.columns([1, 1, 3])
-                abonado = c[0].number_input("Ya abonó $", min_value=0.0, step=0.01,
-                                            format="%.2f")
+                abonado_txt = campo_dinero(c[0], "Ya abonó $")
                 fecha = c[1].date_input("Fecha", value=dt.date.today(), format="DD/MM/YYYY")
                 nota = c[2].text_input("Nota")
                 if st.form_submit_button("Guardar préstamo", type="primary"):
+                    prestado = leer_monto(prestado_txt)
+                    cobrar = leer_monto(cobrar_txt)
+                    abonado = leer_monto(abonado_txt)
                     if not persona:
                         st.error("Falta la persona.")
+                    elif None in (prestado, cobrar, abonado):
+                        st.error("Revisa los montos: escribe por ejemplo 50 o 50,25.")
                     elif prestado <= 0:
                         st.error("Falta el monto prestado.")
                     else:
                         total = cobrar if cobrar > 0 else prestado
-                        agregar("ENCARGOS", {
-                            "PERSONA": persona, "TIPO": "PRÉSTAMO", "DESCRIPCION": "",
-                            "COSTO": prestado, "COBRAR": total, "ABONADO": abonado,
-                            "FECHA": pd.Timestamp(fecha), "NOTA": nota,
-                        })
-                        extra = total - prestado
-                        st.success(f"Préstamo a {persona} por {money(prestado)}"
-                                   + (f", cobras {money(extra)} de más" if extra else ""))
-                        st.rerun()
+                        if abonado > total + 0.004:
+                            st.error("Lo abonado no puede pasar de lo que se cobra.")
+                        else:
+                            agregar("ENCARGOS", {
+                                "PERSONA": persona, "TIPO": "PRÉSTAMO", "DESCRIPCION": "",
+                                "COSTO": prestado, "COBRAR": total, "ABONADO": abonado,
+                                "FECHA": pd.Timestamp(fecha), "NOTA": nota,
+                            })
+                            extra = total - prestado
+                            st.success(f"Préstamo a {persona} por {money(prestado)}"
+                                       + (f", cobras {money(extra)} de más" if extra else ""))
+                            st.rerun()
 
     if ENC.empty:
         st.info("Todavía no hay nada cargado.")
@@ -971,6 +1065,38 @@ elif seccion == "🎁 Por cobrar":
     else:
         st.info("Nada que mostrar con esos filtros.")
 
+    claves = ["PERSONA", "TIPO", "DESCRIPCION", "COSTO", "COBRAR", "FECHA"]
+    dup = ENC[ENC.duplicated(subset=claves, keep=False)]
+    if len(dup):
+        nombres = ", ".join(sorted(dup["PERSONA"].unique()))
+        st.warning(f"Posibles cuentas duplicadas: {nombres}. Revísalas abajo en "
+                   "«Eliminar una cuenta».", icon="⚠️")
+
+    with st.expander("🗑️ Eliminar una cuenta", expanded=len(dup) > 0):
+        st.caption("Para borrar algo que se registró dos veces o por error. "
+                   "No se puede deshacer, salvo desde el historial de versiones del Sheet.")
+        lista = ENC.sort_values(["PERSONA", "FECHA"], na_position="first")
+        ops = {}
+        for n, r in enumerate(lista.itertuples(), 1):
+            marca = "⚠️ " if r.Index in dup.index else ""
+            fecha = f" · {r.FECHA:%d/%m/%Y}" if pd.notna(r.FECHA) else " · sin fecha"
+            ops[f"{marca}#{n} · {r.PERSONA} · {r.TIPO.lower()}"
+                + (f" · {r.DESCRIPCION}" if r.DESCRIPCION else "")
+                + f" · cobrar {money(r.COBRAR)} · abonado {money(r.ABONADO)}{fecha}"] = r.Index
+        primero = next((i for i, k in enumerate(ops) if k.startswith("⚠️")), 0)
+        elegida = st.selectbox("Cuenta a eliminar", list(ops.keys()), index=primero,
+                               key="borrar_enc")
+        idx_b = ops[elegida]
+        if _num(ENC.loc[idx_b, "ABONADO"]) > 0:
+            st.info(f"Esta cuenta tiene {money(ENC.loc[idx_b, 'ABONADO'])} abonados. Si la "
+                    "otra copia no los tiene, borra mejor la que está en cero.")
+        conf = st.checkbox("Sí, quiero borrar esta cuenta", key="conf_borrar_enc")
+        if st.button("🗑️ Eliminar", disabled=not conf, key="btn_borrar_enc"):
+            df = leer("ENCARGOS")
+            guardar("ENCARGOS", df.drop(index=idx_b))
+            st.success("Cuenta eliminada.")
+            st.rerun()
+
     with st.expander("✏️ Editar"):
         edit = st.data_editor(
             enc, num_rows="dynamic", width="stretch", height=400, key="ed_enc",
@@ -1006,20 +1132,21 @@ elif seccion == "💵 Caja Chica":
         actual = 0.0
     else:
         nombre = destino
-        actual = float(caja.loc[caja["UBICACION"] == nombre, "MONTO"].sum())
+        actual = _num(caja.loc[caja["UBICACION"] == nombre, "MONTO"].sum())
         c[1].caption(f"Tiene {money(actual)}.")
 
     with st.form("mov_caja", clear_on_submit=True):
         c = st.columns([1, 1, 1, 1])
         signo = c[0].radio("Tipo", ["Entrada", "Salida"], horizontal=True)
-        monto = c[1].number_input("Monto $", min_value=0.0, step=0.01,
-                                  format="%.2f", value=0.0)
+        monto_txt = campo_dinero(c[1], "Monto $")
         mo = c[2].selectbox("Moneda", ["$", "Bs"])
-        tasa = c[3].number_input("Tasa", min_value=0.0, step=0.01, value=0.0,
-                                 help="Solo si la ubicación maneja bolívares.")
+        tasa_txt = campo_dinero(c[3], "Tasa", ayuda="Solo si la ubicación maneja bolívares.")
         if st.form_submit_button("Aplicar", type="primary"):
+            monto, tasa = leer_monto(monto_txt), leer_monto(tasa_txt)
             if not nombre:
                 st.error("Falta la ubicación.")
+            elif monto is None or tasa is None:
+                st.error("Revisa los números: escribe por ejemplo 12 o 12,55.")
             elif monto <= 0:
                 st.error("El monto debe ser mayor que cero.")
             else:
