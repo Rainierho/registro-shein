@@ -74,3 +74,36 @@ Sin `secrets.toml` arranca en modo `excel` y lee/escribe `REGISTRO_SHEIN.xlsx` d
 
 - `NOMBRE` en INVENTARIO es la clave que une con VENTAS: si repites un nombre en dos lotes, el conteo de existencia se mezcla. La app bloquea altas con nombre duplicado.
 - El botón **Descargar Excel** de la barra lateral genera un respaldo con todo, incluidas las columnas calculadas.
+
+## Respaldo diario
+
+Cada día, al primer uso, la app copia todas las pestañas operativas a una hoja aparte
+(una pestaña por fecha, se conservan 30 días). Para activarlo:
+
+1. Crea en Drive una hoja nueva, por ejemplo `REGISTRO_SHEIN_RESPALDOS`.
+2. Compártela como **Editor** con el `client_email` del service account.
+3. En Streamlit Cloud → app principal → Settings → Secrets, agrega:
+   ```toml
+   backup_spreadsheet_id = "ID_DE_LA_HOJA_DE_RESPALDOS"
+   ```
+
+Para recuperar: `python restaurar_respaldo.py <ID_RESPALDOS>` lista las fechas; agrega la
+fecha, la pestaña (o `TODAS`) y el ID de la hoja principal para restaurar.
+
+## Catálogo para clientes
+
+Es una segunda app del mismo repositorio. Solo muestra nombre, foto, precio y disponibilidad.
+
+1. share.streamlit.io → Create app → mismo repo, rama `main`, **Main file path: `catalogo.py`**.
+2. Secrets: los mismos de la app principal (`backend`, `spreadsheet_id`, `gcp_service_account`).
+3. Deja esta app pública y la principal restringida a tu correo (Settings → Sharing).
+4. En la app principal → Inventario → «🛍️ Catálogo para clientes»: nombre, WhatsApp y
+   la dirección del catálogo.
+
+Fotos: columna FOTO del inventario (enlace https). Para que algo no salga: OCULTAR = SI.
+
+## Tasa BCV
+
+Se trae sola una vez al día desde ve.dolarapi.com (respaldo: bcv.org.ve). Si la cargas a
+mano ese día, se respeta la tuya. Para desactivar la automática: `tasa_automatica = false`
+en Secrets.

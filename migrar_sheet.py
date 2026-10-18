@@ -52,7 +52,10 @@ def _fecha(v):
         return None
     if isinstance(v, (int, float)):
         return EPOCA_SHEETS + dt.timedelta(days=float(v))
-    return pd.to_datetime(v, dayfirst=True, errors="coerce")
+    s = str(v).strip()
+    if len(s) >= 8 and s[:4].isdigit() and s[4] == "-":       # 2026-07-01: ISO, no invertir
+        return pd.to_datetime(s, format="ISO8601", errors="coerce")
+    return pd.to_datetime(s, dayfirst=True, errors="coerce")
 
 
 def normalizar(df, tab):
