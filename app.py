@@ -720,6 +720,7 @@ def gastos_calculados(g, tasa=None):
 
 
 CATEGORIAS_GASTO = ["ENVÍO", "EMPAQUE", "DELIVERY", "OTRO"]
+DESTINOS = ["🛍️ Inventario", "🎁 Encargo", "— No importar"]
 
 
 def caja_calculada(caja, tasa=None):
@@ -1502,22 +1503,28 @@ elif seccion == "📦 Inventario":
                               pd.to_numeric(INV["PRECIO_COMPRA"], errors="coerce"))
                     ratios = ratios.replace([float("inf")], float("nan")).dropna()
                     mult_def = round(float(ratios.median()), 1) if len(ratios) else 2.5
-                    c = st.columns([1, 3])
-                    mult = c[0].number_input("Precio de venta = costo ×", min_value=1.0,
-                                             max_value=10.0, value=mult_def, step=0.1,
+                    c = st.columns([2, 1, 3])
+                    modo_precio = c[0].radio("Precio de venta", ["Sugerido por margen", "Lo pongo yo"],
+                                             horizontal=True, key="imp_modo_precio")
+                    mult = c[1].number_input("Costo ×", min_value=1.0, max_value=10.0,
+                                             value=mult_def, step=0.1,
+                                             disabled=modo_precio == "Lo pongo yo",
                                              help="Por defecto, tu margen habitual.")
-                    c[1].caption(f"Tu margen habitual es ×{mult_def}. El precio se redondea "
-                                 "hacia arriba a los precios que sueles usar (5, 6, 8, 10…).")
+                    c[2].caption(
+                        f"Sugerido: costo × {mult}, redondeado hacia arriba a los precios que "
+                        f"sueles usar (5, 6, 8, 10…). Tu margen habitual es ×{mult_def}."
+                        if modo_precio == "Sugerido por margen" else
+                        "La columna de precio arranca vacía: llénala tú. No se importa hasta "
+                        "que cada producto tenga su precio.")
                     escalera = sorted(set(pd.to_numeric(INV["PRECIO_VENTA"], errors="coerce")
                                           .dropna()) |
                                       {3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 15, 18, 20, 25, 30, 35, 40,
                                        45, 50, 60, 70, 80, 100})
-                    lineas, exacto, envio_total, pagado_total = [], True, 0.0, 0.0
+                    lineas, exacto, envio_total = [], True, 0.0
                     for p_ in pedidos_sel:
                         ls = costear({**p_, "lineas": [dict(l_) for l_ in p_["lineas"]]}, inv_raw)
                         exacto = exacto and all(l_["COSTO_REAL"] for l_ in ls)
                         envio_total += p_["envio"]
-                        pagado_total += p_["total"]
                         for l_ in ls:
                             l_["PEDIDO"] = p_["numero"]
                         lineas.extend(ls)
@@ -1532,59 +1539,85 @@ elif seccion == "📦 Inventario":
                                 nom, k_ = f"{base_n} {k_}", k_ + 1
                             usados.add(nom)
                         filas_imp.append({
-                            "IMPORTAR": not bool(l_["COINCIDE"]),
+                            "DESTINO": DESTINOS[2] if l_["COINCIDE"] else DESTINOS[0],
+                            "PARA": "",
                             "FOTO": l_["FOTO"],
                             "NOMBRE": nom,
                             "CANTIDAD": int(l_["CANTIDAD"]),
                             "COSTO": round(l_["COSTO"], 2),
-                            "PRECIO_VENTA": precio_sugerido(l_["COSTO"], mult, escalera),
+                            "PRECIO_VENTA": (precio_sugerido(l_["COSTO"], mult, escalera)
+                                             if modo_precio == "Sugerido por margen" else None),
                             "ESTADO": (f"✅ ya está como {l_['COINCIDE']} ({l_['COMO']})"
                                        if l_["COINCIDE"] else "🆕 nuevo"),
                             "DESCRIPCION": l_["DESCRIPCION"],
                             "ATRIBUTO": l_["ATRIBUTO"],
                             "SKU": l_["SKU"],
+                            "PEDIDO": l_["PEDIDO"],
                             "COINCIDE_INV": l_["COINCIDE"] or "",
                         })
                     tabla = pd.DataFrame(filas_imp)
+                    tabla["PRECIO_VENTA"] = pd.to_numeric(tabla["PRECIO_VENTA"], errors="coerce")
                     n_ya = int((tabla["COINCIDE_INV"] != "").sum())
                     st.caption(
                         f"{len(tabla)} productos, {int(tabla['CANTIDAD'].sum())} unidades"
-                        + (f" · {n_ya} ya están en tu inventario y vienen desmarcados" if n_ya
-                           else "")
+                        + (f" · {n_ya} ya están en tu inventario y vienen en «No importar»"
+                           if n_ya else "")
                         + ". " + ("Costos exactos según el precio de cada producto." if exacto
                                   else "La página no trae el precio de cada producto: el costo "
                                        "se estimó según lo que te suele costar cada tipo, y la "
                                        "suma da exactamente lo que pagaste. Corrígelo donde "
                                        "sepas el precio real."))
-                    clave_ed = "ed_imp_" + "_".join(sorted(p_["numero"] for p_ in pedidos_sel)) \
-                               + f"_{mult}"
+                    clave_ed = ("ed_imp_" + "_".join(sorted(p_["numero"] for p_ in pedidos_sel))
+                                + f"_{mult}_{modo_precio}")
+                    personas_conocidas = sorted(x for x in ENC["PERSONA"].unique() if x) \
+                        if len(ENC) else []
                     ed_imp = st.data_editor(
                         tabla, key=clave_ed, hide_index=True, width="stretch", height=430,
-                        column_order=["IMPORTAR", "FOTO", "NOMBRE", "CANTIDAD", "COSTO",
+                        column_order=["DESTINO", "PARA", "FOTO", "NOMBRE", "CANTIDAD", "COSTO",
                                       "PRECIO_VENTA", "ESTADO", "DESCRIPCION", "ATRIBUTO"],
                         disabled=["FOTO", "ESTADO", "DESCRIPCION", "ATRIBUTO"],
                         column_config={
-                            "IMPORTAR": st.column_config.CheckboxColumn("✔", width="small"),
+                            "DESTINO": st.column_config.SelectboxColumn(
+                                "Destino", options=DESTINOS, required=True, width="small"),
+                            "PARA": st.column_config.TextColumn(
+                                "Encargo para", width="small",
+                                help="Solo si el destino es Encargo. Personas conocidas: "
+                                     + (", ".join(personas_conocidas[:15]) or "ninguna aún")),
                             "FOTO": st.column_config.ImageColumn("Foto", width="small"),
                             "NOMBRE": st.column_config.TextColumn("Nombre corto", width="medium"),
                             "CANTIDAD": st.column_config.NumberColumn("Cant.", min_value=1,
                                                                       step=1, format="%d"),
                             "COSTO": st.column_config.NumberColumn("Costo c/u", format="$%.2f",
                                                                    min_value=0.0),
-                            "PRECIO_VENTA": st.column_config.NumberColumn("Venta",
-                                                                          format="$%.2f",
-                                                                          min_value=0.0),
+                            "PRECIO_VENTA": st.column_config.NumberColumn(
+                                "Venta / cobrar c/u", format="$%.2f", min_value=0.0,
+                                help="Inventario: precio de venta. Encargo: lo que le cobras "
+                                     "por unidad."),
                             "ESTADO": st.column_config.TextColumn("Estado", width="medium"),
                             "DESCRIPCION": st.column_config.TextColumn("Descripción SHEIN"),
                         })
-                    sel = ed_imp[ed_imp["IMPORTAR"]]
-                    costo_sel = float((sel["COSTO"] * sel["CANTIDAD"]).sum())
-                    st.caption("Si marcas uno que ya está, su cantidad **se suma** a ese producto "
-                               "en vez de crear uno nuevo; cambia «Cant.» para sumar solo las que "
-                               "faltan.")
-
-                    st.markdown(f"**A importar:** {len(sel)} productos · "
-                                f"{int(sel['CANTIDAD'].sum())} unidades · costo {money(costo_sel)}")
+                    a_inv = ed_imp[ed_imp["DESTINO"] == DESTINOS[0]]
+                    a_enc = ed_imp[ed_imp["DESTINO"] == DESTINOS[1]]
+                    usar = pd.concat([a_inv, a_enc])
+                    costo_sel = float((usar["COSTO"] * usar["CANTIDAD"]).sum())
+                    st.caption("**Inventario** entra a tu stock y al catálogo. **Encargo** crea la "
+                               "cuenta en Por cobrar para esa persona (no sale en el catálogo). "
+                               "Si mandas a Inventario uno que ya está, su cantidad se **suma** "
+                               "a ese producto; cambia «Cant.» para sumar solo las que faltan.")
+                    n_pers = a_enc["PARA"].astype(str).str.strip().replace("", pd.NA).nunique()
+                    st.markdown(
+                        f"**A importar:** {len(a_inv)} productos al inventario "
+                        f"({int(a_inv['CANTIDAD'].sum())} u.)"
+                        + (f" · {len(a_enc)} en encargos para {n_pers} persona(s)"
+                           if len(a_enc) else "")
+                        + f" · costo {money(costo_sel)}")
+                    perdida = usar[pd.to_numeric(usar["PRECIO_VENTA"], errors="coerce")
+                                   < pd.to_numeric(usar["COSTO"], errors="coerce")]
+                    if len(perdida):
+                        st.warning(f"{len(perdida)} productos tienen precio de venta o cobro "
+                                   "por debajo de su costo: "
+                                   + ", ".join(perdida["NOMBRE"].astype(str)[:5])
+                                   + ". Revísalos si no fue a propósito.", icon="⚠️")
                     c = st.columns([1, 1, 2])
                     lote_imp = c[0].number_input(
                         "Lote", min_value=1, step=1,
@@ -1598,30 +1631,45 @@ elif seccion == "📦 Inventario":
                         envio_gasto = st.checkbox(
                             f"Registrar el envío de {money(envio_total)} en Gastos (lote "
                             f"{lote_imp})", value=True, key="imp_envio")
-                    if st.button(f"📥 Importar {len(sel)} productos", type="primary",
-                                 disabled=sel.empty, key="btn_importar"):
-                        nuevos = sel[sel["COINCIDE_INV"] == ""]
-                        sumar = sel[sel["COINCIDE_INV"] != ""]
-                        nombres = nuevos["NOMBRE"].astype(str).str.strip().str.upper()
+                    if st.button(f"📥 Importar {len(usar)} productos", type="primary",
+                                 disabled=usar.empty, key="btn_importar"):
+                        nuevos = a_inv[a_inv["COINCIDE_INV"] == ""]
+                        sumar = a_inv[a_inv["COINCIDE_INV"] != ""]
+                        nombres = nuevos["NOMBRE"].fillna("").astype(str).str.strip().str.upper()
                         repetidos = sorted(set(nombres[nombres.duplicated()]) |
                                            (set(nombres) & set(INV["NOMBRE"])))
+                        sin_precio_inv = a_inv[~(pd.to_numeric(a_inv["PRECIO_VENTA"],
+                                                               errors="coerce") > 0)]
+                        sin_para = a_enc[a_enc["PARA"].fillna("").astype(str).str.strip() == ""]
+                        sin_cobro = a_enc[~(pd.to_numeric(a_enc["PRECIO_VENTA"],
+                                                          errors="coerce") > 0)]
                         sale = costo_sel + (envio_total if envio_gasto else 0.0)
                         delta, _, err = plan_caja(ubic_imp, -sale)
                         if (nombres == "").any():
-                            st.error("Hay productos sin nombre corto.")
+                            st.error("Hay productos para inventario sin nombre corto.")
                         elif repetidos:
                             st.error("Estos nombres ya existen o se repiten: "
                                      + ", ".join(repetidos[:8]) + ". Cámbialos para que cada "
                                      "producto lleve su propio contador de ventas.")
+                        elif len(sin_precio_inv):
+                            st.error(f"Faltan {len(sin_precio_inv)} precios de venta en los "
+                                     "productos para inventario: "
+                                     + ", ".join(sin_precio_inv["NOMBRE"].astype(str)[:6]) + ".")
+                        elif len(sin_para):
+                            st.error(f"Hay {len(sin_para)} encargos sin persona: escribe en "
+                                     "«Encargo para» de quién es cada uno.")
+                        elif len(sin_cobro):
+                            st.error(f"Faltan {len(sin_cobro)} montos a cobrar en los encargos: "
+                                     "ponlo en «Venta / cobrar c/u».")
                         elif err:
                             st.error(err)
                         else:
                             df_inv = leer("INVENTARIO")
                             df_inv["CANTIDAD"] = pd.to_numeric(df_inv["CANTIDAD"],
                                                                errors="coerce").fillna(0)
-                            # los que dejaste desmarcados como "ya está" son el mismo producto:
+                            # los "No importar" que ya estaban son el mismo producto:
                             # se les guarda el código y la foto para reconocerlos la próxima vez
-                            for r_ in ed_imp[(~ed_imp["IMPORTAR"]) &
+                            for r_ in ed_imp[(ed_imp["DESTINO"] == DESTINOS[2]) &
                                              (ed_imp["COINCIDE_INV"] != "")].itertuples():
                                 m_ = df_inv["NOMBRE"] == r_.COINCIDE_INV
                                 if m_.any() and not str(df_inv.loc[m_, "SKU"].iloc[0]).strip():
@@ -1644,9 +1692,28 @@ elif seccion == "📦 Inventario":
                                 "PRECIO_VENTA": float(r_.PRECIO_VENTA), "LOTE": int(lote_imp),
                                 "FOTO": r_.FOTO, "OCULTAR": "", "SKU": r_.SKU,
                             } for r_ in nuevos.itertuples()]
-                            guardar("INVENTARIO", pd.concat([df_inv, pd.DataFrame(filas_n)],
-                                                            ignore_index=True))
-                            if no_llego and int(lote_imp) not in EN_CAMINO:
+                            if len(filas_n) or len(sumar) or (ed_imp["COINCIDE_INV"] != "").any():
+                                guardar("INVENTARIO", pd.concat([df_inv, pd.DataFrame(filas_n)],
+                                                                ignore_index=True))
+                            # encargos: una cuenta por producto, a nombre de la persona
+                            por_norm = {_norm(x): x for x in personas_conocidas}
+                            filas_e = []
+                            for r_ in a_enc.itertuples():
+                                quien = str(r_.PARA).strip().upper()
+                                quien = por_norm.get(_norm(quien), quien)
+                                filas_e.append({
+                                    "PERSONA": quien, "TIPO": "ENCARGO",
+                                    "DESCRIPCION": f"{r_.NOMBRE}"
+                                                   + (f" x{int(r_.CANTIDAD)}" if r_.CANTIDAD > 1
+                                                      else ""),
+                                    "COSTO": round(float(r_.COSTO) * int(r_.CANTIDAD), 2),
+                                    "COBRAR": round(float(r_.PRECIO_VENTA) * int(r_.CANTIDAD), 2),
+                                    "ABONADO": 0.0, "MONEDA": "$", "FECHA": pd.Timestamp(hoy()),
+                                    "ULT_ABONO": None, "NOTA": f"pedido SHEIN {r_.PEDIDO}",
+                                })
+                            if filas_e:
+                                anexar("ENCARGOS", filas_e)
+                            if no_llego and len(filas_n) and int(lote_imp) not in EN_CAMINO:
                                 set_lote(int(lote_imp), "EN CAMINO")
                             if envio_gasto:
                                 agregar("GASTOS", {
@@ -1656,11 +1723,17 @@ elif seccion == "📦 Inventario":
                                     "UBICACION": ubic_imp or ""})
                             extra = aplicar_caja(ubic_imp, delta, "Compra",
                                                  f"pedido SHEIN lote {int(lote_imp)}")
-                            avisar(f"Importados {len(filas_n)} productos nuevos"
-                                   + (f" y sumadas unidades a {len(sumar)} existentes"
-                                      if len(sumar) else "")
-                                   + f" en el lote {int(lote_imp)}"
-                                   + (" (en camino)" if no_llego else "") + "." + extra)
+                            partes = []
+                            if filas_n:
+                                partes.append(f"{len(filas_n)} productos nuevos al lote "
+                                              f"{int(lote_imp)}" + (" (en camino)" if no_llego
+                                                                    else ""))
+                            if len(sumar):
+                                partes.append(f"unidades sumadas a {len(sumar)} existentes")
+                            if filas_e:
+                                partes.append(f"{len(filas_e)} encargos para "
+                                              f"{len({f['PERSONA'] for f in filas_e})} persona(s)")
+                            avisar("Importados: " + ", ".join(partes) + "." + extra)
                             st.rerun()
 
     with st.expander("➕ Agregar producto"):
