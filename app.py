@@ -692,33 +692,53 @@ def guardar_foto(nombre, foto_inv, img_b64=None):
     guardar("INVENTARIO", df)
 
 
+def _palabras_clave(texto):
+    return {_norm(x) for x in re.findall(r"[A-Za-zÁÉÍÓÚÑÜáéíóúñü]+", str(texto))
+            if len(x) > 2 and _norm(x) not in PALABRAS_VACIAS}
+
+
 def sugerir_precargados(lineas, inv, lotes_recientes):
-    """Productos que cargaste a mano antes de importar: no tienen código ni foto de SHEIN y su
-    descripción es tuya. Se proponen los del lote reciente (o en camino) que sean del mismo tipo
-    y tengan la misma cantidad o un nombre parecido. Quedan para que tú los confirmes."""
+    """Productos que cargaste a mano antes de importar (sin código ni foto de SHEIN, con tu
+    propio nombre). Solo se proponen cuando la elección es clara:
+    - es el único producto de ese tipo en tu lote reciente y en el pedido, o
+    - le gana con claridad a los demás del mismo tipo por nombre, color y cantidad.
+    Si hay duda no se propone nada: lo eliges tú en «Ya está como»."""
     cand = inv[inv["LOTE"].isin(lotes_recientes)
                & ~(inv["SKU"].astype(str).str.strip() != "")]
     tomados = {l_["COINCIDE"] for l_ in lineas if l_["COINCIDE"]}
-    puntajes = []
+    tipo_l = {}
     for i, l_ in enumerate(lineas):
-        if l_["COINCIDE"]:
+        if not l_["COINCIDE"]:
+            _, w, _p = _sustantivo(l_["DESCRIPCION"])
+            if w and tipo_de(w):
+                tipo_l[i] = tipo_de(w)
+    propuestas = []
+    for r in cand.itertuples():
+        if r.NOMBRE in tomados:
             continue
-        _, w, palabras = _sustantivo(l_["DESCRIPCION"])
-        tipo_l = tipo_de(w) if w else None
-        if not tipo_l:
+        tipo_r = _tipo(str(r.NOMBRE).split()[0])
+        mismos = [i for i, tp in tipo_l.items() if tp == tipo_r]
+        if not mismos:
             continue
-        pal_l = {_norm(x) for x in palabras if len(x) > 2 and _norm(x) not in PALABRAS_VACIAS}
-        for r in cand.itertuples():
-            if _tipo(str(r.NOMBRE).split()[0]) != tipo_l:
-                continue
-            texto = f"{r.NOMBRE} {r.DESCRIPCION}"
-            pal_r = {_norm(x) for x in re.findall(r"[A-Za-zÁÉÍÓÚÑÜáéíóúñü]+", texto)
-                     if len(x) > 2 and _norm(x) not in PALABRAS_VACIAS}
-            jac = len(pal_l & pal_r) / len(pal_l | pal_r) if pal_l | pal_r else 0.0
-            misma_cant = _ent(r.CANTIDAD) == _ent(l_["CANTIDAD"])
-            if misma_cant or jac >= 0.25:
-                puntajes.append((misma_cant + jac, i, r.NOMBRE))
-    for pt, i, n in sorted(puntajes, reverse=True):
+        hermanos = (cand["NOMBRE"].astype(str).str.split().str[0].map(_tipo) == tipo_r).sum()
+        # palabras de TU nombre/descripción, sin el tipo (collar, lentes…), que siempre coincide
+        pal_r = {w for w in _palabras_clave(f"{r.NOMBRE} {r.DESCRIPCION}")
+                 if tipo_de(w) != tipo_r}
+        notas = []
+        for i in mismos:
+            l_ = lineas[i]
+            pal_l = _palabras_clave(f"{l_['DESCRIPCION']} {l_['ATRIBUTO']}")
+            # cuánto de lo que tú escribiste aparece en lo de SHEIN
+            cubre = len(pal_l & pal_r) / len(pal_r) if pal_r else 0.0
+            cant_r, cant_l = _ent(r.CANTIDAD), _ent(l_["CANTIDAD"])
+            cerca = abs(cant_r - cant_l) <= max(1, round(0.2 * max(cant_r, cant_l)))
+            notas.append((cubre + 0.5 * (cant_r == cant_l) + 0.25 * cerca, i))
+        notas.sort(reverse=True)
+        unico = len(mismos) == 1 and hermanos == 1
+        claro = notas[0][0] >= 0.75 and (len(notas) == 1 or notas[0][0] - notas[1][0] >= 0.3)
+        if unico or claro:
+            propuestas.append((notas[0][0] + unico, notas[0][1], r.NOMBRE))
+    for pt, i, n in sorted(propuestas, reverse=True):
         if lineas[i]["COINCIDE"] or n in tomados:
             continue
         lineas[i]["COINCIDE"], lineas[i]["COMO"] = n, "precargado, revísalo"
@@ -1685,6 +1705,7 @@ elif seccion == "📦 Inventario":
                         if len(ENC) else []
                     ed_imp = st.data_editor(
                         tabla, key=clave_ed, hide_index=True, width="stretch", height=430,
+                        num_rows="delete",
                         column_order=["DESTINO", "PARA", "YA_ESTA", "FOTO", "NOMBRE", "CANTIDAD",
                                       "COSTO", "PRECIO_VENTA", "ESTADO", "DESCRIPCION",
                                       "ATRIBUTO"],
@@ -1717,6 +1738,10 @@ elif seccion == "📦 Inventario":
                             "DESCRIPCION": st.column_config.TextColumn("Descripción SHEIN"),
                         })
                     ed_imp["YA_ESTA"] = ed_imp["YA_ESTA"].fillna("").astype(str).str.strip()
+                    borradas = len(tabla) - len(ed_imp)
+                    if borradas:
+                        st.caption(f"🗑️ {borradas} filas borradas de esta importación (no se "
+                                   "importan). Para recuperarlas, vuelve a elegir los pedidos.")
                     a_inv = ed_imp[ed_imp["DESTINO"] == D_INV]
                     a_sum = ed_imp[ed_imp["DESTINO"] == D_SUMAR]
                     a_enc = ed_imp[ed_imp["DESTINO"] == D_ENC]
