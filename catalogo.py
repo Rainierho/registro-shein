@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Catálogo para clientes: lo disponible, con foto y precio en $ y Bs.
+Catálogo para clientes: lo disponible, con foto y precio en dólares.
 Es una app aparte (Main file: catalogo.py) que lee el mismo Google Sheet que app.py,
 pero solo muestra nombre, descripción, foto, precio y disponibilidad. Nunca costos,
 deudas ni caja.
@@ -88,6 +88,24 @@ def wa_numero(tel):
     return ""
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def tasa_usdt():
+    """Bs por USDT en Binance P2P: mediana de los 10 primeros anuncios de compra.
+    La mediana ignora el anuncio suelto muy por debajo o por encima del mercado."""
+    import statistics
+    import requests
+    try:
+        r = requests.post(
+            "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+            json={"asset": "USDT", "fiat": "VES", "tradeType": "BUY", "page": 1, "rows": 10,
+                  "payTypes": [], "publisherType": None},
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        precios = [float(a["adv"]["price"]) for a in r.json().get("data", [])]
+        return statistics.median(precios) if precios else None
+    except Exception:
+        return None
+
+
 def ve(x, simbolo):
     """Formato venezolano: $7,00 · Bs 6.160,81"""
     s = f"{x:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
@@ -120,8 +138,8 @@ cfg = datos["CONFIG"]
 conf = dict(zip(cfg["CLAVE"].astype(str).str.upper(), cfg["VALOR"])) if len(cfg) else {}
 NOMBRE = str(conf.get("CATALOGO_NOMBRE") or "Catálogo")
 WHATSAPP = wa_numero(conf.get("CATALOGO_WHATSAPP"))
-TASA = _num(conf.get("TASA")) or None
-TASA_FECHA = str(conf.get("TASA_FECHA") or "")
+MOSTRAR_USDT = str(conf.get("CATALOGO_PRECIO_USDT") or "").upper() == "SI"
+TASA_USDT = tasa_usdt() if MOSTRAR_USDT else None
 
 st.set_page_config(page_title=NOMBRE, page_icon="🛍️", layout="wide")
 
@@ -151,7 +169,7 @@ disp["TIPO"] = disp["NOMBRE"].str.split().str[0].str.capitalize()
 
 st.title(f"🛍️ {NOMBRE}")
 st.caption(f"{len(disp)} productos disponibles"
-           + (f" · precios en bolívares a tasa BCV del {TASA_FECHA}" if TASA else ""))
+           + (" · bolívares a tasa USDT" if TASA_USDT else ""))
 
 if disp.empty:
     st.info("Por ahora no hay productos disponibles. ¡Vuelve pronto!")
@@ -195,14 +213,15 @@ for grupo in filas:
             if desc:
                 st.caption(desc[:140] + ("…" if len(desc) > 140 else ""))
             precio = ve(p["PRECIO"], "$")
-            if TASA:
-                precio += f"  ·  {ve(p['PRECIO'] * TASA, 'Bs')}"
-            st.markdown(f"### {precio}" if not TASA else f"#### {precio}")
+            if TASA_USDT:
+                precio += f"  ·  {ve(p['PRECIO'] * TASA_USDT, 'Bs')}"
+            st.markdown(f"### {precio}" if not TASA_USDT else f"#### {precio}")
             st.caption("🔥 ¡Última unidad!" if p["QUEDAN"] == 1
                        else ("Quedan pocas" if p["QUEDAN"] <= 2 else "Disponible"))
             if WHATSAPP:
-                msg = (f"¡Hola! Me interesa *{p['NOMBRE'].title()}* "
-                       f"({ve(p['PRECIO'], '$')}) que vi en el catálogo.")
+                ref = ve(p["PRECIO"], "$") + (f" / {ve(p['PRECIO'] * TASA_USDT, 'Bs')}"
+                                               if TASA_USDT else "")
+                msg = f"¡Hola! Me interesa *{p['NOMBRE'].title()}* ({ref}) que vi en el catálogo."
                 st.link_button("📲 Lo quiero", f"https://wa.me/{WHATSAPP}?text={quote(msg)}",
                                width="stretch")
 

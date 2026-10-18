@@ -309,6 +309,23 @@ def tasa_bcv():
     return None, None, motivo
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def tasa_usdt():
+    """Bs por USDT en Binance P2P: mediana de los 10 primeros anuncios de compra."""
+    import statistics
+    import requests
+    try:
+        r = requests.post(
+            "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search",
+            json={"asset": "USDT", "fiat": "VES", "tradeType": "BUY", "page": 1, "rows": 10,
+                  "payTypes": [], "publisherType": None},
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        precios = [float(a["adv"]["price"]) for a in r.json().get("data", [])]
+        return statistics.median(precios) if precios else None
+    except Exception:
+        return None
+
+
 RESPALDO_TABS = ["INVENTARIO", "VENTAS", "ENCARGOS", "CAJA", "GASTOS", "MOVIMIENTOS",
                  "CONTACTOS", "CONFIG"]
 RESPALDO_DIAS = 30
@@ -1275,14 +1292,24 @@ elif seccion == "📦 Inventario":
             wa_c = c[1].text_input("WhatsApp donde te escriben",
                                    value=str(_cfg.get("CATALOGO_WHATSAPP") or ""),
                                    placeholder="0414-1234567")
-            url_n = st.text_input("Dirección del catálogo (cuando lo publiques)", value=url_cat,
-                                  placeholder="https://tu-catalogo.streamlit.app")
+            c = st.columns([3, 1])
+            url_n = c[0].text_input("Dirección del catálogo (cuando lo publiques)",
+                                    value=url_cat, placeholder="https://tu-catalogo.streamlit.app")
+            mostrar_usdt = c[1].checkbox(
+                "Precio en Bs a tasa USDT",
+                value=str(_cfg.get("CATALOGO_PRECIO_USDT") or "").upper() == "SI",
+                help="Precio en dólares × tasa USDT de Binance P2P, igual que el bot.")
+            t_usdt = tasa_usdt()
+            st.caption(f"Tasa USDT ahora: {t_usdt:,.2f} Bs (Binance P2P). Un producto de $30 "
+                       f"saldría a Bs {30 * t_usdt:,.2f}." if t_usdt
+                       else "No se pudo consultar Binance ahora; el catálogo lo reintenta solo.")
             if st.form_submit_button("Guardar ajustes del catálogo"):
                 if wa_c.strip() and not wa_numero(wa_c):
                     st.error("Ese número de WhatsApp no es válido.")
                 else:
                     set_config(CATALOGO_NOMBRE=nom_c.strip() or "Catálogo",
-                               CATALOGO_WHATSAPP=wa_c.strip(), CATALOGO_URL=url_n.strip())
+                               CATALOGO_WHATSAPP=wa_c.strip(), CATALOGO_URL=url_n.strip(),
+                               CATALOGO_PRECIO_USDT="SI" if mostrar_usdt else "NO")
                     avisar("Ajustes del catálogo guardados.")
                     st.rerun()
 
