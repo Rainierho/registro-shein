@@ -26,7 +26,7 @@ TABS = {
     "DEUDAS": ["DEUDOR", "MONTO", "BOLOS", "NOTA"],
     "CAJA": ["UBICACION", "MONTO", "MONEDA", "TASA"],
     "ENCARGOS": ["PERSONA", "TIPO", "DESCRIPCION", "COSTO", "COBRAR", "ABONADO", "MONEDA",
-                 "FECHA", "ULT_ABONO", "NOTA"],
+                 "FECHA", "ULT_ABONO", "NOTA", "FOTO"],
     "CONFIG": ["CLAVE", "VALOR"],
     "GASTOS": ["FECHA", "CATEGORIA", "CONCEPTO", "LOTE", "MONTO", "MONEDA", "UBICACION"],
     "MOVIMIENTOS": ["FECHA", "UBICACION", "MONTO", "MONEDA", "SALDO", "ORIGEN", "DETALLE"],
@@ -1710,6 +1710,7 @@ elif seccion == "📦 Inventario":
                                     "COBRAR": round(float(r_.PRECIO_VENTA) * int(r_.CANTIDAD), 2),
                                     "ABONADO": 0.0, "MONEDA": "$", "FECHA": pd.Timestamp(hoy()),
                                     "ULT_ABONO": None, "NOTA": f"pedido SHEIN {r_.PEDIDO}",
+                                    "FOTO": r_.FOTO,
                                 })
                             if filas_e:
                                 anexar("ENCARGOS", filas_e)
@@ -2070,6 +2071,10 @@ elif seccion == "🎁 Por cobrar":
         quien = etiquetas[sel]
         cuentas = pend[pend["PERSONA"] == quien].sort_values("FECHA", na_position="first")
         monedas = cuentas["MONEDA"].unique()
+        con_foto = cuentas[cuentas["FOTO"].astype(str).str.startswith("http")]
+        if len(con_foto):
+            st.image(list(con_foto["FOTO"])[:8], width=70,
+                     caption=[str(d)[:18] for d in list(con_foto["DESCRIPCION"])[:8]])
 
         destino = "TODAS"
         if len(cuentas) > 1:
@@ -2173,7 +2178,9 @@ elif seccion == "🎁 Por cobrar":
                 c = st.columns([2, 3])
                 ubic = selector_caja(c[0], "Caja", "caja_enc")
                 c[1].caption("Del lugar elegido sale el costo y entra lo que ya abonó.")
-                nota = st.text_input("Nota")
+                c = st.columns(2)
+                nota = c[0].text_input("Nota")
+                foto_enc = c[1].text_input("Foto (enlace, opcional)", placeholder="https://…")
                 if st.form_submit_button("Guardar encargo", type="primary"):
                     costo = leer_monto(costo_txt)
                     cobrar = leer_monto(cobrar_txt)
@@ -2196,7 +2203,7 @@ elif seccion == "🎁 Por cobrar":
                             "COSTO": costo or None, "COBRAR": cobrar, "ABONADO": abonado,
                             "MONEDA": mon, "FECHA": pd.Timestamp(fecha),
                             "ULT_ABONO": pd.Timestamp(fecha) if abonado else None,
-                            "NOTA": nota,
+                            "NOTA": nota, "FOTO": foto_enc.strip(),
                         })
                         extra = aplicar_caja(ubic, delta, "Encargo", f"{persona}: {desc}")
                         avisar(f"Encargo de {persona}: cobras {plata(cobrar, mon)}"
@@ -2238,7 +2245,7 @@ elif seccion == "🎁 Por cobrar":
                             "COSTO": prestado, "COBRAR": total, "ABONADO": abonado,
                             "MONEDA": mon, "FECHA": pd.Timestamp(fecha),
                             "ULT_ABONO": pd.Timestamp(fecha) if abonado else None,
-                            "NOTA": nota,
+                            "NOTA": nota, "FOTO": foto_enc.strip(),
                         })
                         extra = aplicar_caja(ubic, delta, "Préstamo", persona)
                         dif = total - prestado
@@ -2271,11 +2278,12 @@ elif seccion == "🎁 Por cobrar":
     detalle = st.checkbox("Ver cuenta por cuenta", value=False)
     if detalle:
         st.dataframe(
-            e[["PERSONA", "TIPO", "DESCRIPCION", "MONEDA", "COSTO", "COBRAR", "ABONADO",
-               "SALDO", "GANANCIA", "FECHA", "ULT_ABONO", "NOTA"]]
+            e[["FOTO", "PERSONA", "TIPO", "DESCRIPCION", "MONEDA", "COSTO", "COBRAR",
+               "ABONADO", "SALDO", "GANANCIA", "FECHA", "ULT_ABONO", "NOTA"]]
             .sort_values(["SALDO", "PERSONA"], ascending=False),
             width="stretch", hide_index=True, height=360,
             column_config={
+                "FOTO": st.column_config.ImageColumn("Foto", width="small"),
                 "COSTO": st.column_config.NumberColumn(format="%.2f"),
                 "COBRAR": st.column_config.NumberColumn(format="%.2f"),
                 "ABONADO": st.column_config.NumberColumn(format="%.2f"),
@@ -2375,6 +2383,7 @@ elif seccion == "🎁 Por cobrar":
                 "MONEDA": st.column_config.SelectboxColumn(options=["$", "Bs"]),
                 "FECHA": st.column_config.DateColumn(format="DD/MM/YYYY"),
                 "ULT_ABONO": st.column_config.DateColumn("ÚLT. ABONO", format="DD/MM/YYYY"),
+                "FOTO": st.column_config.TextColumn(help="Enlace https a la imagen."),
             },
         )
         st.caption("Editar aquí no mueve la caja: es para corregir datos.")
