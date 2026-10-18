@@ -168,7 +168,13 @@ disp = inv[(inv["QUEDAN"] > 0) & (inv["PRECIO"].fillna(0) > 0)
 disp["TIPO"] = disp["NOMBRE"].str.split().str[0].str.capitalize()
 
 st.title(f"🛍️ {NOMBRE}")
-st.caption(f"{len(disp)} productos disponibles"
+if WHATSAPP:
+    visible = f"0{WHATSAPP[2:5]}-{WHATSAPP[5:]}"          # 584141234567 -> 0414-1234567
+    hola = quote("¡Hola! Vi tu catálogo y quiero hacer un pedido.")
+    st.markdown(f"📲 **Escríbenos por WhatsApp: "
+                f"[{visible}](https://wa.me/{WHATSAPP}?text={hola})**")
+st.caption((f"{len(disp)} productos disponibles" if len(disp) != 1
+            else "1 producto disponible")
            + (" · bolívares a tasa USDT" if TASA_USDT else ""))
 
 if disp.empty:
