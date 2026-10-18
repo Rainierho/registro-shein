@@ -47,15 +47,16 @@ def _matriz(valores):
 
 
 @st.cache_data(ttl=300, show_spinner="Cargando catálogo...")
-def cargar():
+def cargar(backend, id_hoja):
+    """La caché depende de qué hoja se lee: si cambias los Secrets, no reusa lo viejo."""
     tabs = ("INVENTARIO", "VENTAS", "CONFIG")
-    if secreto("backend", "excel") == "gsheets":
+    if backend == "gsheets":
         import gspread
         from google.oauth2.service_account import Credentials
 
         creds = Credentials.from_service_account_info(
             dict(st.secrets["gcp_service_account"]), scopes=SCOPES)
-        libro = gspread.authorize(creds).open_by_key(secreto("spreadsheet_id"))
+        libro = gspread.authorize(creds).open_by_key(id_hoja)
         datos = {}
         for t in tabs:
             try:
@@ -93,7 +94,28 @@ def ve(x, simbolo):
     return f"{simbolo}{s}" if simbolo == "$" else f"{simbolo} {s}"
 
 
-datos = cargar()
+# --- diagnóstico: nunca mostrar "vacío" cuando el problema es de configuración
+BACKEND = secreto("backend")
+if BACKEND is None:
+    st.set_page_config(page_title="Catálogo", page_icon="🛍️")
+    st.error("El catálogo no encuentra sus **Secrets**, así que no sabe qué hoja leer.")
+    st.markdown("En share.streamlit.io → esta app → **⋮ → Settings → Secrets**, pega los "
+                "mismos secrets de tu app principal y guarda. La app se reinicia sola.")
+    st.stop()
+if BACKEND == "gsheets" and (not secreto("spreadsheet_id")
+                             or not secreto("gcp_service_account")):
+    st.set_page_config(page_title="Catálogo", page_icon="🛍️")
+    faltan = [k for k in ("spreadsheet_id", "gcp_service_account") if not secreto(k)]
+    st.error("A los Secrets del catálogo les falta: " + ", ".join(faltan) + ".")
+    st.stop()
+try:
+    datos = cargar(BACKEND, secreto("spreadsheet_id") or secreto("excel_path", ""))
+except Exception as e:
+    st.set_page_config(page_title="Catálogo", page_icon="🛍️")
+    st.error(f"No se pudo leer la hoja ({type(e).__name__}: {e}).")
+    st.caption("Revisa que el spreadsheet_id sea el mismo de la app principal y que la "
+               "hoja esté compartida con el correo del service account.")
+    st.stop()
 cfg = datos["CONFIG"]
 conf = dict(zip(cfg["CLAVE"].astype(str).str.upper(), cfg["VALOR"])) if len(cfg) else {}
 NOMBRE = str(conf.get("CATALOGO_NOMBRE") or "Catálogo")
@@ -106,7 +128,11 @@ st.set_page_config(page_title=NOMBRE, page_icon="🛍️", layout="wide")
 inv, ven = datos["INVENTARIO"], datos["VENTAS"]
 if inv.empty or "NOMBRE" not in inv.columns:
     st.title(NOMBRE)
-    st.info("El catálogo está vacío por ahora.")
+    if BACKEND != "gsheets":
+        st.error("El catálogo está en modo Excel local y no encontró el archivo. En "
+                 "Streamlit Cloud los Secrets deben decir backend = \"gsheets\".")
+    else:
+        st.info("La pestaña INVENTARIO de tu hoja está vacía o no existe.")
     st.stop()
 
 for c in ("DESCRIPCION", "FOTO", "OCULTAR"):
