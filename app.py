@@ -32,7 +32,7 @@ TABS = {
     "MOVIMIENTOS": ["FECHA", "UBICACION", "MONTO", "MONEDA", "SALDO", "ORIGEN", "DETALLE"],
     "CONTACTOS": ["PERSONA", "TELEFONO"],
     "LOTES": ["LOTE", "ESTADO", "LLEGADA"],
-    "FOTOS": ["NOMBRE", "IMG"],
+    "FOTOS": ["NOMBRE", "IMG", "ID"],
     "VENTAS_HIST": ["NOMBRE", "MONTO", "FECHA", "LOTE"],
     "INVENTARIO_HIST": ["NOMBRE", "SKU", "PROPIETARIO", "TALLA", "CANTIDAD", "PRECIO_COMPRA",
                         "PRECIO_VENTA", "TIPO", "CATEGORIA", "LOTE", "FECHA_LOTE"],
@@ -605,8 +605,8 @@ def emparejar(lineas, inv, umbral=0.85):
     (el más parecido), para que dos artículos de la misma línea no se confundan."""
     import difflib
     skus = {str(s): n for s, n in zip(inv["SKU"], inv["NOMBRE"]) if str(s).strip()}
-    fotos = {_clave_foto(f): n for f, n in zip(inv["FOTO"], inv["NOMBRE"])
-             if str(f).startswith("http")}
+    fotos = {_clave_foto(r): n for f, n in zip(inv["FOTO"], inv["NOMBRE"])
+             for r in fotos_de(f) if r.startswith("http")}
     descs = [(str(d).lower().strip(), n) for d, n in zip(inv["DESCRIPCION"], inv["NOMBRE"])
              if len(str(d).strip()) > 8]
     candidatos = []                      # (parecido, indice de la línea, nombre en inventario)
@@ -631,8 +631,10 @@ def emparejar(lineas, inv, umbral=0.85):
     return lineas
 
 
-FOTO_PROPIA = "foto_propia"      # en INVENTARIO.FOTO: la imagen está en la pestaña FOTOS
+FOTO_PROPIA = "foto_propia"      # formato viejo: una foto subida, ligada al nombre del producto
 MAX_CARACTERES_FOTO = 30000      # cabe en una celda de Sheets (50.000) y de Excel (32.767)
+MAX_FOTOS = 6
+SEP_FOTOS = " | "                # INVENTARIO.FOTO: "enlace | propia:ab12cd34 | enlace"
 
 
 def comprimir_foto(contenido):
@@ -655,41 +657,103 @@ def comprimir_foto(contenido):
     return None
 
 
-def imagen_de(foto, nombre, fotos_propias):
-    """Lo que st.image necesita: el enlace, o los bytes de la foto subida."""
+def fotos_de(valor):
+    """Celda FOTO -> lista de fotos en orden (la primera es la principal).
+    Cada una es un enlace https, «propia:<id>» o el formato viejo «foto_propia»."""
+    salida = []
+    for parte in str(valor or "").split("|"):
+        p = parte.strip()
+        if p.startswith("http") or p.startswith("propia:") or p == FOTO_PROPIA:
+            salida.append(p)
+    return salida
+
+
+def principal(valor):
+    """Primera foto de la celda (para emparejar y para el formato de una sola foto)."""
+    f = fotos_de(valor)
+    return f[0] if f else ""
+
+
+def tiene_foto(serie):
+    return serie.map(lambda v: bool(fotos_de(v)))
+
+
+def mapa_fotos():
+    """Pestaña FOTOS -> {"id": base64} y, para el formato viejo, {"viejo:NOMBRE": base64}."""
+    fotos = leer("FOTOS")
+    mapa = {}
+    for r in fotos.itertuples():
+        id_ = str(getattr(r, "ID", "") or "").strip()
+        mapa[id_ if id_ else f"viejo:{r.NOMBRE}"] = r.IMG
+    return mapa
+
+
+def imagen_de(ref, nombre, mapa):
+    """Lo que st.image necesita para una foto: el enlace, o los bytes de la subida."""
     import base64
-    foto = str(foto or "").strip()
-    if foto.startswith("http"):
-        return foto
-    if foto == FOTO_PROPIA and nombre in fotos_propias:
+    ref = str(ref or "").strip()
+    if ref.startswith("http"):
+        return ref
+    clave = ref[len("propia:"):] if ref.startswith("propia:") else (
+        f"viejo:{nombre}" if ref == FOTO_PROPIA else None)
+    if clave and clave in mapa:
         try:
-            return base64.b64decode(fotos_propias[nombre])
+            return base64.b64decode(mapa[clave])
         except Exception:
             return None
     return None
 
 
-def tiene_foto(serie):
-    s = serie.astype(str).str.strip()
-    return s.str.startswith("http") | (s == FOTO_PROPIA)
-
-
-def guardar_foto(nombre, foto_inv, img_b64=None):
-    """Asigna la foto de un producto: enlace (foto_inv=https…), propia (img_b64) o ninguna."""
-    if img_b64 is not None:
-        fotos = leer("FOTOS")
-        if nombre in set(fotos["NOMBRE"]):
-            fotos.loc[fotos["NOMBRE"] == nombre, "IMG"] = img_b64
-            guardar("FOTOS", fotos)
-        else:
-            anexar("FOTOS", [{"NOMBRE": nombre, "IMG": img_b64}])
-        foto_inv = FOTO_PROPIA
-    elif nombre in set(leer("FOTOS")["NOMBRE"]):       # enlace o quitar: borrar la propia
-        fotos = leer("FOTOS")
-        guardar("FOTOS", fotos[fotos["NOMBRE"] != nombre])
+def _escribir_fotos(nombre, refs):
     df = leer("INVENTARIO")
-    df.loc[df["NOMBRE"] == nombre, "FOTO"] = foto_inv
+    df.loc[df["NOMBRE"] == nombre, "FOTO"] = SEP_FOTOS.join(refs)
     guardar("INVENTARIO", df)
+
+
+def agregar_foto(nombre, enlace=None, img_b64=None):
+    """Suma una foto al final de la galería del producto. Devuelve un error o None."""
+    import uuid
+    inv = leer("INVENTARIO")
+    actual = inv.loc[inv["NOMBRE"] == nombre, "FOTO"]
+    refs = fotos_de(actual.iloc[0] if len(actual) else "")
+    if len(refs) >= MAX_FOTOS:
+        return f"Ya tiene {MAX_FOTOS} fotos: quita una para agregar otra."
+    if img_b64 is not None:
+        id_ = uuid.uuid4().hex[:10]
+        anexar("FOTOS", [{"NOMBRE": nombre, "IMG": img_b64, "ID": id_}])
+        refs.append(f"propia:{id_}")
+    else:
+        if enlace in refs:
+            return "Esa foto ya está en el producto."
+        refs.append(enlace)
+    _escribir_fotos(nombre, refs)
+    return None
+
+
+def quitar_foto(nombre, ref):
+    """Saca una foto de la galería; si era subida, borra también su copia en FOTOS."""
+    inv = leer("INVENTARIO")
+    actual = inv.loc[inv["NOMBRE"] == nombre, "FOTO"]
+    refs = [r for r in fotos_de(actual.iloc[0] if len(actual) else "") if r != ref]
+    if ref.startswith("propia:") or ref == FOTO_PROPIA:
+        fotos = leer("FOTOS")
+        ids = fotos["ID"].astype(str).str.strip() if "ID" in fotos else pd.Series("", fotos.index)
+        if ref.startswith("propia:"):
+            quedan = fotos[ids != ref[len("propia:"):]]
+        else:
+            quedan = fotos[~((fotos["NOMBRE"] == nombre) & (ids == ""))]
+        if len(quedan) != len(fotos):
+            guardar("FOTOS", quedan)
+    _escribir_fotos(nombre, refs)
+
+
+def hacer_principal(nombre, ref):
+    inv = leer("INVENTARIO")
+    actual = inv.loc[inv["NOMBRE"] == nombre, "FOTO"]
+    refs = fotos_de(actual.iloc[0] if len(actual) else "")
+    if ref in refs:
+        refs.remove(ref)
+        _escribir_fotos(nombre, [ref] + refs)
 
 
 def _palabras_clave(texto):
@@ -2002,48 +2066,84 @@ elif seccion == "📦 Inventario":
             nombres_f = sorted(lista_f["NOMBRE"])
             prod_f = st.selectbox("Producto", nombres_f, key="fotos_prod")
             fila_f = INV[INV["NOMBRE"] == prod_f].iloc[0]
-            c = st.columns([1, 2])
-            with c[0]:
-                fotos_propias = (dict(zip(leer("FOTOS")["NOMBRE"], leer("FOTOS")["IMG"]))
-                                 if str(fila_f["FOTO"]).strip() == FOTO_PROPIA else {})
-                img = imagen_de(fila_f["FOTO"], prod_f, fotos_propias)
-                if img is not None:
-                    st.image(img, width=180, caption="Foto actual")
-                else:
-                    st.caption("Sin foto todavía.")
-                if str(fila_f["DESCRIPCION"]).strip():
-                    st.caption(str(fila_f["DESCRIPCION"])[:120])
-            with c[1]:
-                subida = st.file_uploader("Subir imagen (jpg, png o webp)",
-                                          type=["jpg", "jpeg", "png", "webp"],
-                                          key=f"up_foto_{prod_f}")
-                enlace = st.text_input("…o pegar el enlace de la imagen",
-                                       placeholder="https://…", key=f"url_foto_{prod_f}")
-                b1, b2 = st.columns(2)
-                if b1.button("💾 Guardar foto", type="primary", key=f"btn_foto_{prod_f}",
-                             disabled=subida is None and not enlace.strip()):
-                    if subida is not None:
-                        b64 = comprimir_foto(subida.getvalue())
-                        if b64 is None:
-                            st.error("No pude leer ese archivo como imagen.")
+            refs_f = fotos_de(fila_f["FOTO"])
+            if str(fila_f["DESCRIPCION"]).strip():
+                st.caption(str(fila_f["DESCRIPCION"])[:160])
+
+            # ---- galería actual: la primera es la principal ----
+            if refs_f:
+                mapa_f = mapa_fotos() if any(not r.startswith("http") for r in refs_f) else {}
+                st.markdown(f"**Fotos ({len(refs_f)} de {MAX_FOTOS})** — la primera es la "
+                            "principal: la que se ve primero en el catálogo.")
+                cols_f = st.columns(MAX_FOTOS)
+                for i_f, ref_f in enumerate(refs_f):
+                    with cols_f[i_f]:
+                        img = imagen_de(ref_f, prod_f, mapa_f)
+                        if img is not None:
+                            st.image(img, width="stretch",
+                                     caption="⭐ principal" if i_f == 0 else f"{i_f + 1}")
                         else:
-                            guardar_foto(prod_f, None, b64)
-                            avisar(f"Foto de {prod_f} guardada. Sale en el catálogo en unos "
-                                   "minutos.")
+                            st.caption(f"{i_f + 1}: no se pudo cargar")
+                        if i_f > 0 and st.button("⭐", key=f"pri_{prod_f}_{i_f}",
+                                                 help="Hacerla principal", width="stretch"):
+                            hacer_principal(prod_f, ref_f)
+                            avisar(f"Nueva foto principal para {prod_f}.")
                             st.rerun()
-                    elif not enlace.strip().startswith("http"):
-                        st.error("El enlace debe empezar por https://")
-                    else:
-                        guardar_foto(prod_f, enlace.strip())
-                        avisar(f"Foto de {prod_f} guardada. Sale en el catálogo en unos minutos.")
+                        if st.button("🗑️", key=f"del_{prod_f}_{i_f}", help="Quitar esta foto",
+                                     width="stretch"):
+                            quitar_foto(prod_f, ref_f)
+                            avisar(f"Se quitó una foto de {prod_f}.")
+                            st.rerun()
+            else:
+                st.caption("Sin fotos todavía.")
+
+            # ---- agregar ----
+            if len(refs_f) < MAX_FOTOS:
+                c = st.columns([3, 2])
+                subidas = c[0].file_uploader(
+                    "Subir imágenes (jpg, png o webp) — puedes elegir varias",
+                    type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True,
+                    key=f"up_foto_{prod_f}")
+                enlace = c[1].text_input("…o pegar el enlace de una imagen",
+                                         placeholder="https://…", key=f"url_foto_{prod_f}")
+                hay = bool(subidas) or bool(enlace.strip())
+                if st.button("➕ Agregar fotos", type="primary", key=f"btn_foto_{prod_f}",
+                             disabled=not hay):
+                    libres = MAX_FOTOS - len(refs_f)
+                    puestas, errores = 0, []
+                    for s_ in (subidas or [])[:libres]:
+                        b64 = comprimir_foto(s_.getvalue())
+                        if b64 is None:
+                            errores.append(f"«{s_.name}» no es una imagen que pueda leer")
+                            continue
+                        err = agregar_foto(prod_f, img_b64=b64)
+                        if err:
+                            errores.append(err)
+                            break
+                        puestas += 1
+                    if len(subidas or []) > libres:
+                        errores.append(f"solo cabían {libres}; el resto no se subió")
+                    if enlace.strip():
+                        if not enlace.strip().startswith("http"):
+                            errores.append("el enlace debe empezar por https://")
+                        else:
+                            err = agregar_foto(prod_f, enlace=enlace.strip())
+                            if err:
+                                errores.append(err)
+                            else:
+                                puestas += 1
+                    if puestas:
+                        avisar(f"{puestas} foto(s) agregada(s) a {prod_f}. Salen en el catálogo "
+                               "en unos minutos."
+                               + (" Ojo: " + "; ".join(errores) + "." if errores else ""))
                         st.rerun()
-                if tiene_foto(pd.Series([fila_f["FOTO"]])).iloc[0] and \
-                        b2.button("🗑️ Quitar foto", key=f"btn_quitar_foto_{prod_f}"):
-                    guardar_foto(prod_f, "")
-                    avisar(f"Se quitó la foto de {prod_f}.")
-                    st.rerun()
-                st.caption("Desde el teléfono, «Subir imagen» te deja tomar la foto con la "
-                           "cámara. Se reduce sola para que quepa en tu Sheet.")
+                    else:
+                        st.error("No se agregó ninguna foto: " + "; ".join(errores) + ".")
+                st.caption("Desde el teléfono, «Subir imágenes» te deja tomar la foto con la "
+                           "cámara. Cada una se reduce sola para que quepa en tu Sheet. Con más "
+                           "de una, en el catálogo se ven como pasarela.")
+            else:
+                st.caption(f"Tiene el máximo de {MAX_FOTOS} fotos. Quita una para agregar otra.")
 
     with st.expander(f"🚚 Lotes en camino ({len(EN_CAMINO)})", expanded=bool(EN_CAMINO)):
         st.caption("Los productos de un lote en camino no salen en el catálogo. Cuando llegue, "

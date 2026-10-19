@@ -46,13 +46,23 @@ def _matriz(valores):
     return pd.DataFrame(filas[1:], columns=cab)
 
 
-FOTO_PROPIA = "foto_propia"
+FOTO_PROPIA = "foto_propia"      # formato viejo: una foto subida ligada al nombre
+
+
+def fotos_de(valor):
+    """Celda FOTO -> fotos en orden: enlaces, «propia:<id>» o el formato viejo."""
+    salida = []
+    for parte in str(valor or "").split("|"):
+        q = parte.strip()
+        if q.startswith("http") or q.startswith("propia:") or q == FOTO_PROPIA:
+            salida.append(q)
+    return salida
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def cargar_fotos(backend, id_hoja):
-    """Fotos subidas desde la app (pestaña FOTOS): {NOMBRE: bytes}. Solo se lee si hace falta."""
-    import base64
+    """Fotos subidas desde la app (pestaña FOTOS): {id o "viejo:NOMBRE": base64}.
+    Solo se lee si algún producto disponible las usa."""
     df = pd.DataFrame()
     try:
         if backend == "gsheets":
@@ -63,17 +73,74 @@ def cargar_fotos(backend, id_hoja):
             libro = gspread.authorize(creds).open_by_key(id_hoja)
             df = _matriz(libro.worksheet("FOTOS").get_values(value_render_option="UNFORMATTED_VALUE"))
         else:
-            df = pd.read_excel(id_hoja, sheet_name="FOTOS")
+            df = pd.read_excel(id_hoja, sheet_name="FOTOS", dtype=str).fillna("")
             df.columns = [str(c).strip().upper() for c in df.columns]
     except Exception:
         return {}
     salida = {}
-    for n, img in zip(df.get("NOMBRE", []), df.get("IMG", [])):
-        try:
-            salida[str(n).strip()] = base64.b64decode(str(img))
-        except Exception:
-            pass
+    ids = df["ID"] if "ID" in df.columns else [""] * len(df)
+    for n, img, id_ in zip(df.get("NOMBRE", []), df.get("IMG", []), ids):
+        id_ = str(id_ or "").strip()
+        salida[id_ if id_ else f"viejo:{str(n).strip()}"] = str(img)
     return salida
+
+
+def fuente_foto(ref, nombre):
+    """Una foto -> dirección que entiende el navegador (enlace o data:image/jpeg;base64)."""
+    if ref.startswith("http"):
+        return ref
+    clave = ref[len("propia:"):] if ref.startswith("propia:") else f"viejo:{nombre}"
+    b64 = FOTOS_PROPIAS.get(clave)
+    return f"data:image/jpeg;base64,{b64}" if b64 else None
+
+
+def pasarela(fuentes, alto=320):
+    """Varias fotos en una tira deslizable: con el dedo en el teléfono, con flechas y puntos
+    en la computadora."""
+    import html as h
+    slides = "".join(f'<div class="s"><img loading="lazy" alt="" src="{h.escape(f, quote=True)}">'
+                     f'</div>' for f in fuentes)
+    puntos = "".join(f'<span class="d" data-i="{i}"></span>' for i in range(len(fuentes)))
+    pagina = f"""
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}} html,body{{background:transparent;overflow:hidden}}
+.w{{position:relative;height:{alto}px;border-radius:10px;overflow:hidden;background:rgba(128,128,128,.08)}}
+.t{{display:flex;height:100%;overflow-x:auto;scroll-snap-type:x mandatory;scrollbar-width:none;
+   -webkit-overflow-scrolling:touch;scroll-behavior:smooth}}
+.t::-webkit-scrollbar{{display:none}}
+.s{{flex:0 0 100%;height:100%;scroll-snap-align:center;display:flex;align-items:center;
+   justify-content:center}}
+.s img{{max-width:100%;max-height:100%;object-fit:contain;user-select:none;-webkit-user-drag:none}}
+.b{{position:absolute;top:50%;transform:translateY(-50%);border:0;width:34px;height:34px;
+   border-radius:50%;background:rgba(0,0,0,.45);color:#fff;font-size:20px;line-height:34px;
+   cursor:pointer}}
+.b:hover{{background:rgba(0,0,0,.65)}} .p{{left:8px}} .n{{right:8px}}
+.ds{{position:absolute;bottom:10px;width:100%;text-align:center}}
+.d{{display:inline-block;width:8px;height:8px;margin:0 3px;border-radius:50%;cursor:pointer;
+   background:rgba(255,255,255,.55);box-shadow:0 0 3px rgba(0,0,0,.6)}}
+.d.on{{background:#fff;transform:scale(1.25)}}
+</style>
+<div class="w"><div class="t" id="t">{slides}</div>
+<button class="b p" aria-label="anterior" onclick="ir(-1)">&#8249;</button>
+<button class="b n" aria-label="siguiente" onclick="ir(1)">&#8250;</button>
+<div class="ds">{puntos}</div></div>
+<script>
+const t=document.getElementById('t'), ds=[...document.querySelectorAll('.d')], n=ds.length;
+let cur=0, quieto;
+const actual=()=>Math.round(t.scrollLeft/Math.max(t.clientWidth,1));
+function pinta(i){{ds.forEach((d,j)=>d.classList.toggle('on',j===i));}}
+function a(i){{cur=i; pinta(i); t.scrollTo({{left:i*t.clientWidth}});}}
+function ir(k){{a((cur+k+n)%n);}}            // usa la foto destino, no la del medio del giro
+t.addEventListener('scroll',()=>{{clearTimeout(quieto);
+  quieto=setTimeout(()=>{{cur=actual(); pinta(cur);}},120);}});   // deslizar con el dedo
+ds.forEach(d=>d.addEventListener('click',()=>a(+d.dataset.i)));
+pinta(0);
+</script>"""
+    if hasattr(st, "iframe"):              # Streamlit 1.5x+: components.html va a desaparecer
+        st.iframe(pagina, height=alto)
+    else:
+        import streamlit.components.v1 as components
+        components.html(pagina, height=alto)
 
 
 @st.cache_data(ttl=300, show_spinner="Cargando catálogo...")
@@ -203,8 +270,10 @@ disp = inv[(inv["QUEDAN"] > 0) & (inv["PRECIO"].fillna(0) > 0)
            & (~inv["LOTE_N"].isin(en_camino))
            & (inv["OCULTAR"].astype(str).str.strip().str.upper() != "SI")].copy()
 disp["TIPO"] = disp["NOMBRE"].str.split().str[0].str.capitalize()
+disp["FOTOS_L"] = disp["FOTO"].map(fotos_de)
 FOTOS_PROPIAS = (cargar_fotos(BACKEND, secreto("spreadsheet_id") or secreto("excel_path", ""))
-                 if (disp["FOTO"].astype(str).str.strip() == FOTO_PROPIA).any() else {})
+                 if disp["FOTOS_L"].map(lambda l: any(not r.startswith("http") for r in l)).any()
+                 else {})
 
 st.title(f"🛍️ {NOMBRE}")
 if WHATSAPP:
@@ -238,8 +307,7 @@ elif orden == "Mayor precio":
 elif orden == "Nombre":
     v = v.sort_values("NOMBRE")
 else:   # primero los que tienen foto, luego los que quedan pocos
-    con_f = v["FOTO"].astype(str).str.startswith("http") | (v["FOTO"].astype(str) == FOTO_PROPIA)
-    v = v.assign(_f=~con_f).sort_values(["_f", "QUEDAN"])
+    v = v.assign(_f=v["FOTOS_L"].map(len) == 0).sort_values(["_f", "QUEDAN"])
 
 if v.empty:
     st.info("No hay productos con esa búsqueda.")
@@ -251,11 +319,15 @@ for grupo in filas:
     cols = st.columns(por_fila)
     for col, (_, p) in zip(cols, grupo.iterrows()):
         with col.container(border=True):
-            foto = str(p["FOTO"]).strip()
-            if foto.startswith("http"):
-                st.image(foto, width="stretch")
-            elif foto == FOTO_PROPIA and p["NOMBRE"] in FOTOS_PROPIAS:
-                st.image(FOTOS_PROPIAS[p["NOMBRE"]], width="stretch")
+            fuentes = [f for f in (fuente_foto(r, p["NOMBRE"]) for r in p["FOTOS_L"]) if f]
+            if len(fuentes) > 1:
+                pasarela(fuentes)
+            elif fuentes:
+                f0 = fuentes[0]
+                if f0.startswith("data:"):
+                    import base64
+                    f0 = base64.b64decode(f0.split(",", 1)[1])
+                st.image(f0, width="stretch")
             st.markdown(f"**{p['NOMBRE'].title()}**")
             desc = str(p["DESCRIPCION"]).strip()
             if desc:
