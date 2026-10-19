@@ -109,3 +109,20 @@ systemctl status cloudflared      # túnel
 
 Déjalas una semana mientras confirmas que todo anda, y luego bórralas desde share.streamlit.io.
 Leen y escriben el mismo Sheet, así que no se pierde nada; solo evita usar las dos a la vez.
+
+## Vistas previas de productos (lyhoshop.com/p/...)
+
+Para que al compartir el enlace de un producto aparezca su foto y precio, el túnel tiene que
+mandar las direcciones `/p/...` al servicio `lyho-enlaces` (puerto 8503).
+
+En Cloudflare → **Networking → Tunnels → lyhoshop → Routes → Add route → Published application**:
+
+| Subdominio | Dominio | Path | Service URL |
+|---|---|---|---|
+| *(vacío)* | lyhoshop.com | `^/p/` | `http://localhost:8503` |
+
+Luego **arrástrala al primer lugar** de la lista (con los puntitos de la izquierda): las rutas se
+revisan de arriba hacia abajo, y si queda debajo de `lyhoshop.com`, esa se la come.
+
+Prueba: `https://lyhoshop.com/p/` debe llevarte al catálogo. Para ver la tarjeta como la ve
+WhatsApp, pega el enlace de un producto en https://www.opengraph.xyz

@@ -8,6 +8,9 @@ from zoneinfo import ZoneInfo
 import io
 import re
 import os
+from pathlib import Path
+
+from comun import slug
 
 import pandas as pd
 import plotly.express as px
@@ -1305,6 +1308,211 @@ def registrar_mov(ubic, delta, moneda, saldo, origen, detalle=""):
         st.session_state["aviso_bitacora"] = f"No se pudo anotar en la bitácora: {e}"
 
 
+NOMBRE_TIENDA = "Lyho Shop"
+
+# --------------------------------------------------------------------------
+# Imágenes para estados e historias (📣 Promocionar)
+# --------------------------------------------------------------------------
+RUTA_ASSETS = Path(__file__).resolve().parent / "assets"
+PAL = {"teal": (90, 151, 172), "celeste": (161, 202, 220), "crema": (238, 237, 233),
+       "rosa": (247, 174, 194), "vino": (174, 81, 102), "texto": (46, 59, 66), "blanco": (255, 255, 255)}
+FORMATOS = {"Historia / estado (1080×1920)": (1080, 1920), "Publicación (1080×1350)": (1080, 1350)}
+
+
+def _fuente(peso, tam):
+    from PIL import ImageFont
+    try:
+        return ImageFont.truetype(str(RUTA_ASSETS / "fuentes" / f"Poppins-{peso}.ttf"), tam)
+    except OSError:
+        return ImageFont.load_default(tam)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def bajar_foto(url):
+    import requests
+    try:
+        r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        return r.content if r.ok else None
+    except Exception:
+        return None
+
+
+def foto_principal_bytes(nombre, valor_foto, mapa):
+    """Bytes de la foto principal de un producto (enlace o subida), o None."""
+    import base64
+    for ref in fotos_de(valor_foto):
+        if ref.startswith("http"):
+            b = bajar_foto(ref)
+        else:
+            img = imagen_de(ref, nombre, mapa)
+            b = img if isinstance(img, (bytes, bytearray)) else None
+        if b:
+            return bytes(b)
+    return None
+
+
+def _envolver(draw, texto, fuente, ancho_max, lineas_max=2):
+    palabras, lineas, actual = texto.split(), [], ""
+    for w in palabras:
+        prueba = (actual + " " + w).strip()
+        if draw.textlength(prueba, font=fuente) <= ancho_max:
+            actual = prueba
+        else:
+            if actual:
+                lineas.append(actual)
+            actual = w
+    if actual:
+        lineas.append(actual)
+    if len(lineas) > lineas_max:
+        lineas = lineas[:lineas_max]
+        while draw.textlength(lineas[-1] + "…", font=fuente) > ancho_max and " " in lineas[-1]:
+            lineas[-1] = lineas[-1].rsplit(" ", 1)[0]
+        lineas[-1] += "…"
+    return lineas
+
+
+def _centrado(draw, y, texto, fuente, color, ancho):
+    w = draw.textlength(texto, font=fuente)
+    draw.text(((ancho - w) / 2, y), texto, font=fuente, fill=color)
+
+
+def _pegar_foto(lienzo, datos, caja, radio=36):
+    """Foto ajustada (sin recortar) dentro de una tarjeta clara con esquinas redondeadas."""
+    from PIL import Image, ImageDraw, ImageOps
+    x0, y0, x1, y1 = caja
+    tarjeta = Image.new("RGB", (x1 - x0, y1 - y0), (232, 241, 245))
+    if datos:
+        try:
+            foto = ImageOps.exif_transpose(Image.open(io.BytesIO(datos))).convert("RGB")
+            foto.thumbnail((x1 - x0 - 40, y1 - y0 - 40))
+            tarjeta.paste(foto, ((tarjeta.width - foto.width) // 2, (tarjeta.height - foto.height) // 2))
+        except Exception:
+            pass
+    mascara = Image.new("L", tarjeta.size, 0)
+    ImageDraw.Draw(mascara).rounded_rectangle((0, 0, *tarjeta.size), radius=radio, fill=255)
+    lienzo.paste(tarjeta, (x0, y0), mascara)
+
+
+def _cabecera_img(lienzo, alto_banda):
+    from PIL import Image, ImageDraw
+    d = ImageDraw.Draw(lienzo)
+    d.rectangle((0, 0, lienzo.width, alto_banda), fill=PAL["teal"])
+    try:
+        logo = Image.open(RUTA_ASSETS / "logo_lyhoshop.png").convert("RGBA")
+        ancho = int(lienzo.width * 0.72)
+        logo = logo.resize((ancho, int(logo.height * ancho / logo.width)))
+        lienzo.paste(logo, ((lienzo.width - ancho) // 2, (alto_banda - logo.height) // 2), logo)
+    except OSError:
+        _centrado(d, alto_banda // 3, NOMBRE_TIENDA, _fuente("Bold", 90), PAL["blanco"], lienzo.width)
+
+
+def _pie_img(lienzo, y, whatsapp, enlace):
+    from PIL import ImageDraw
+    d = ImageDraw.Draw(lienzo)
+    W = lienzo.width
+    texto = f"Pídelo por WhatsApp {whatsapp}" if whatsapp else "Pídelo por WhatsApp"
+    f = _fuente("Bold", 42)
+    w = d.textlength(texto, font=f)
+    d.rounded_rectangle(((W - w) / 2 - 40, y, (W + w) / 2 + 40, y + 92), radius=46, fill=PAL["rosa"])
+    d.text(((W - w) / 2, y + 18), texto, font=f, fill=PAL["texto"])
+    if enlace:
+        _centrado(d, y + 112, enlace, _fuente("SemiBold", 40), PAL["teal"], W)
+
+
+def _chip(d, x, y, texto, fondo, color):
+    f = _fuente("Bold", 34)
+    w = d.textlength(texto, font=f)
+    d.rounded_rectangle((x, y, x + w + 48, y + 64), radius=32, fill=fondo)
+    d.text((x + 24, y + 10), texto, font=f, fill=color)
+
+
+def imagen_un_producto(p, formato, whatsapp, enlace, tasa_bs=None):
+    """Una imagen por producto: foto grande, nombre, precio y cómo pedirlo.
+    Se arma de abajo hacia arriba (pie, precio, nombre) y la foto ocupa lo que sobra,
+    para que nada se pise aunque el nombre ocupe dos líneas."""
+    from PIL import Image, ImageDraw
+    W, H = FORMATOS[formato]
+    lienzo = Image.new("RGB", (W, H), PAL["crema"])
+    d = ImageDraw.Draw(lienzo)
+    historia = H > 1500
+    banda = 300 if historia else 210
+    _cabecera_img(lienzo, banda)
+    pie_y = H - (250 if historia else 185)
+    f_nom = _fuente("SemiBold", 62 if historia else 50)
+    f_pre = _fuente("Bold", 140 if historia else 104)
+    f_bs = _fuente("SemiBold", 46 if historia else 38)
+    alto = lambda f, s="Ag$0,9": f.getbbox(s)[3] - f.getbbox(s)[1]
+    lineas = _envolver(d, p["nombre"], f_nom, W - 160)
+    paso_nom = int(alto(f_nom) * 1.35)
+    y = pie_y - (40 if historia else 28)
+    if tasa_bs:
+        y -= alto(f_bs) + 10
+        bs_y = y
+    y -= alto(f_pre, "$0,00") + (20 if historia else 14)
+    precio_y = y
+    y -= paso_nom * len(lineas) + (10 if historia else 6)
+    nombre_y = y
+    foto_y1 = nombre_y - (40 if historia else 26)
+    _pegar_foto(lienzo, p["foto"], (60, banda + 50, W - 60, foto_y1))
+    if p.get("chip"):
+        _chip(d, 90, banda + 80, p["chip"], PAL["vino"], PAL["blanco"])
+    for i, linea in enumerate(lineas):
+        _centrado(d, nombre_y + i * paso_nom, linea, f_nom, PAL["texto"], W)
+    caja = f_pre.getbbox("$0,00")
+    _centrado(d, precio_y - caja[1], p["precio"], f_pre, PAL["vino"], W)
+    if tasa_bs:
+        _centrado(d, bs_y - f_bs.getbbox("Bs")[1], tasa_bs, f_bs, PAL["teal"], W)
+    _pie_img(lienzo, pie_y, whatsapp, enlace)
+    return lienzo
+
+
+def imagen_varios(ps, formato, whatsapp, enlace):
+    """Hasta 4 productos en una sola imagen."""
+    from PIL import Image, ImageDraw
+    W, H = FORMATOS[formato]
+    lienzo = Image.new("RGB", (W, H), PAL["crema"])
+    historia = H > 1500
+    banda = 300 if historia else 210
+    _cabecera_img(lienzo, banda)
+    d = ImageDraw.Draw(lienzo)
+    ps = ps[:4]
+    # en historia, dos productos van uno sobre otro (tarjetas anchas); tres o cuatro, en cuadrícula
+    cols = 1 if len(ps) == 1 or (historia and len(ps) == 2) else 2
+    filas = (len(ps) + cols - 1) // cols
+    zona_y0, zona_y1 = banda + 50, H - (290 if historia else 230)
+    alto_celda = (zona_y1 - zona_y0) // filas
+    ancho_celda = (W - 60 * (cols + 1)) // cols
+    for i, p in enumerate(ps):
+        fi, co = divmod(i, cols)
+        x0 = 60 + co * (ancho_celda + 60)
+        y0 = zona_y0 + fi * alto_celda
+        foto_y1 = y0 + alto_celda - (170 if historia else 140)
+        d.rounded_rectangle((x0, y0, x0 + ancho_celda, y0 + alto_celda - 30), radius=36,
+                            fill=PAL["blanco"])
+        _pegar_foto(lienzo, p["foto"], (x0 + 16, y0 + 16, x0 + ancho_celda - 16, foto_y1), radio=28)
+        f_nom = _fuente("SemiBold", 38 if historia else 32)
+        nom = _envolver(d, p["nombre"], f_nom, ancho_celda - 30, lineas_max=1)[0]
+        w = d.textlength(nom, font=f_nom)
+        d.text((x0 + (ancho_celda - w) / 2, foto_y1 + 10), nom, font=f_nom, fill=PAL["texto"])
+        f_pre = _fuente("Bold", 64 if historia else 52)
+        w = d.textlength(p["precio"], font=f_pre)
+        d.text((x0 + (ancho_celda - w) / 2, foto_y1 + (60 if historia else 50)), p["precio"],
+               font=f_pre, fill=PAL["vino"])
+    _pie_img(lienzo, H - (250 if historia else 190), whatsapp, enlace)
+    return lienzo
+
+
+def monto_ve(x):
+    """Formato venezolano para lo que ven los clientes: 5.000,00"""
+    return f"{x:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+def png_bytes(imagen):
+    buf = io.BytesIO()
+    imagen.save(buf, "PNG", optimize=True)
+    return buf.getvalue()
+
+
 # --------------------------------------------------------------------------
 # Carga
 # --------------------------------------------------------------------------
@@ -1383,6 +1591,19 @@ TELEFONOS = dict(zip(contactos["PERSONA"].astype(str).str.upper(), contactos["TE
 MSG_COBRO = str(_cfg.get("MSG_COBRO") or "") or MSG_COBRO_DEFECTO
 PEND = ENC[~ENC["ESTA_PAGADO"]]
 
+SECCIONES = ["📊 Dashboard", "⚡ Venta rápida", "🧾 Ventas", "📦 Inventario", "📣 Promocionar",
+             "🎁 Por cobrar", "🚚 Gastos", "💵 Caja Chica", "📈 Rotación", "🏛️ Histórico"]
+
+
+def es_movil_app():
+    """En el teléfono la app abre directo en Venta rápida."""
+    try:
+        agente = st.context.headers.get("User-Agent", "") or ""
+    except Exception:
+        agente = ""
+    return bool(re.search(r"Mobi|Android|iPhone|iPod", agente))
+
+
 # --------------------------------------------------------------------------
 # Sidebar
 # --------------------------------------------------------------------------
@@ -1390,8 +1611,7 @@ with st.sidebar:
     st.title("💍 Registro SHEIN")
     seccion = st.radio(
         "Secciones",
-        ["📊 Dashboard", "🧾 Ventas", "📦 Inventario", "🎁 Por cobrar", "🚚 Gastos",
-         "💵 Caja Chica", "📈 Rotación", "🏛️ Histórico"],
+        SECCIONES, index=SECCIONES.index("⚡ Venta rápida") if es_movil_app() else 0,
         label_visibility="collapsed",
     )
     st.divider()
@@ -2586,6 +2806,186 @@ elif seccion == "📦 Inventario":
 # --------------------------------------------------------------------------
 # ENCARGOS Y PRESTAMOS
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# VENTA RÁPIDA (pensada para el teléfono)
+# --------------------------------------------------------------------------
+elif seccion == "⚡ Venta rápida":
+    st.header("⚡ Venta rápida")
+    disponibles = INV[INV["EXISTENCIA"] > 0].sort_values("NOMBRE")
+    if disponibles.empty:
+        st.warning("No hay productos con existencia.")
+    else:
+        n_vr = st.session_state.get("vr_n", 0)
+        info_vr = {r.NOMBRE: r for r in disponibles.itertuples()}
+        nombre_vr = st.selectbox(
+            "Producto", list(info_vr), index=None, key=f"vr_prod_{n_vr}",
+            placeholder="🔎 Toca y escribe para buscar",
+            format_func=lambda n: f"{n} · {money(info_vr[n].PRECIO_VENTA)} · quedan "
+                                  f"{_ent(info_vr[n].EXISTENCIA)}")
+        if nombre_vr:
+            prod = info_vr[nombre_vr]
+            c = st.columns([1, 2])
+            with c[0]:
+                refs_vr = fotos_de(prod.FOTO)
+                if refs_vr:
+                    mapa_vr = mapa_fotos() if not refs_vr[0].startswith("http") else {}
+                    img_vr = imagen_de(refs_vr[0], nombre_vr, mapa_vr)
+                    if img_vr is not None:
+                        st.image(img_vr, width=140)
+            with c[1]:
+                st.markdown(f"**{nombre_vr}**  \nPrecio: **{money(prod.PRECIO_VENTA)}** · "
+                            f"quedan **{_ent(prod.EXISTENCIA)}**")
+            c = st.columns(2)
+            cant_vr = c[0].number_input("Unidades", min_value=1, step=1, value=1,
+                                        max_value=max(_ent(prod.EXISTENCIA), 1),
+                                        key=f"vr_cant_{n_vr}")
+            monto_txt_vr = campo_dinero(c[1], "Precio c/u $", prod.PRECIO_VENTA,
+                                        key=f"vr_monto_{n_vr}_{nombre_vr}")
+            ubic_vr = selector_caja(st, "¿Dónde entró la plata?", f"vr_caja_{n_vr}")
+            cobro_vr = (campos_cobro_bs(st, f"vr_cobro_{n_vr}")
+                        if ubic_vr and moneda_de(ubic_vr) == "Bs" else None)
+            monto_vr = leer_monto(monto_txt_vr)
+            total_vr = (monto_vr or 0) * int(cant_vr)
+            if st.button(f"✅ Vender · {money(total_vr)}", type="primary", width="stretch",
+                         key=f"vr_btn_{n_vr}", disabled=not monto_vr):
+                delta, _, err, nota = plan_caja_bs(ubic_vr, total_vr, cobro_vr)
+                if monto_vr is None or monto_vr <= 0:
+                    st.error(f"Precio inválido: «{monto_txt_vr}».")
+                elif int(cant_vr) > _ent(prod.EXISTENCIA):
+                    st.error(f"Solo quedan {_ent(prod.EXISTENCIA)}.")
+                elif err:
+                    st.error(err)
+                else:
+                    anexar("VENTAS", [{"NOMBRE": nombre_vr, "MONTO": monto_vr,
+                                       "FECHA": pd.Timestamp(hoy()),
+                                       "LOTE": _ent(prod.LOTE) or None}] * int(cant_vr))
+                    extra = aplicar_caja(ubic_vr, delta, "Venta",
+                                         f"{nombre_vr} x{int(cant_vr)}{nota}")
+                    st.session_state["vr_n"] = n_vr + 1
+                    avisar(f"✅ Vendido: {int(cant_vr)} × {nombre_vr} · {money(total_vr)}.{extra}")
+                    st.rerun()
+    st.divider()
+    hoy_vr = VEN[pd.to_datetime(VEN["FECHA"], errors="coerce").dt.normalize()
+                 == pd.Timestamp(hoy())]
+    c = st.columns(2)
+    c[0].metric("Ventas de hoy", len(hoy_vr))
+    c[1].metric("Ingresos de hoy", money(hoy_vr["MONTO"].sum()))
+    if len(hoy_vr):
+        resumen_vr = (hoy_vr.groupby("NOMBRE")["MONTO"].agg(["size", "sum"])
+                      .rename(columns={"size": "Unid.", "sum": "Monto"})
+                      .sort_values("Monto", ascending=False))
+        st.dataframe(resumen_vr, width="stretch",
+                     column_config={"Monto": st.column_config.NumberColumn(format="$%.2f")})
+        st.caption("¿Te equivocaste? Bórrala en 🧾 Ventas → Eliminar una venta.")
+
+# --------------------------------------------------------------------------
+# PROMOCIONAR: imágenes para estados y enlaces de cada producto
+# --------------------------------------------------------------------------
+elif seccion == "📣 Promocionar":
+    st.header("📣 Promocionar")
+    base_url = str(_cfg.get("CATALOGO_URL") or "https://lyhoshop.com").rstrip("/")
+    tel_wa = re.sub(r"\D", "", str(_cfg.get("CATALOGO_WHATSAPP") or ""))
+    tel_vis = (f"0{tel_wa[-10:-7]}-{tel_wa[-7:]}" if len(tel_wa) >= 10 else "")
+    visibles_p = INV[(INV["EXISTENCIA"] > 0) & (INV["PRECIO_VENTA"].fillna(0) > 0)
+                     & (INV["OCULTAR"].astype(str).str.upper() != "SI")
+                     & (~INV["EN_CAMINO"])].copy()
+    visibles_p["CON_FOTO"] = tiene_foto(visibles_p["FOTO"])
+    if visibles_p.empty:
+        st.info("No hay productos visibles en el catálogo para promocionar.")
+    else:
+        t_img, t_enl = st.tabs(["🖼️ Imágenes para estados", "🔗 Enlaces de productos"])
+        with t_img:
+            c = st.columns([3, 2])
+            solo_foto = c[1].checkbox("Solo los que tienen foto", value=True, key="pr_solo_foto")
+            lista_p = visibles_p[visibles_p["CON_FOTO"]] if solo_foto else visibles_p
+            elegidos_p = c[0].multiselect("Productos", sorted(lista_p["NOMBRE"]),
+                                          placeholder="Elige uno o varios", key="pr_productos")
+            c = st.columns(3)
+            formato_p = c[0].selectbox("Formato", list(FORMATOS), key="pr_formato")
+            modo_p = c[1].selectbox("Diseño", ["Una imagen por producto",
+                                               "Varios en una imagen (hasta 4)"], key="pr_modo")
+            con_bs = c[2].checkbox("Mostrar precio en Bs", value=bool(TASA_VAL),
+                                   help="Con la tasa de valoración de la barra lateral.",
+                                   key="pr_bs")
+            if elegidos_p and st.button("🎨 Crear imágenes", type="primary", key="pr_crear"):
+                mapa_p = mapa_fotos()
+                filas_p = visibles_p.set_index("NOMBRE")
+                prods_p = []
+                with st.spinner("Preparando las fotos…"):
+                    for n in elegidos_p:
+                        r = filas_p.loc[n]
+                        chip = ("NUEVO" if r["LOTE"] == INV["LOTE"].max() else
+                                "ÚLTIMA UNIDAD" if r["EXISTENCIA"] == 1 else
+                                "ÚLTIMAS UNIDADES" if r["EXISTENCIA"] <= 2 else "")
+                        prods_p.append({"nombre": n.title(), "slug": slug(n),
+                                        "precio": "$" + monto_ve(r["PRECIO_VENTA"]),
+                                        "bs": ("Bs " + monto_ve(r["PRECIO_VENTA"] * TASA_VAL)
+                                               if con_bs and TASA_VAL else None),
+                                        "foto": foto_principal_bytes(n, r["FOTO"], mapa_p),
+                                        "chip": chip})
+                    hechas = []
+                    if modo_p.startswith("Una"):
+                        for p_ in prods_p:
+                            enlace_p = f"{base_url.split('://')[-1]}/p/{p_['slug']}"
+                            hechas.append((f"{p_['slug']}.png",
+                                           imagen_un_producto(p_, formato_p, tel_vis, enlace_p,
+                                                              p_["bs"])))
+                    else:
+                        for i in range(0, len(prods_p), 4):
+                            hechas.append((f"lyhoshop-{i // 4 + 1}.png",
+                                           imagen_varios(prods_p[i:i + 4], formato_p, tel_vis,
+                                                         base_url.split("://")[-1])))
+                st.session_state["pr_hechas"] = [(n, png_bytes(im)) for n, im in hechas]
+                sin_foto = [p_["nombre"] for p_ in prods_p if not p_["foto"]]
+                if sin_foto:
+                    st.warning("No pude cargar la foto de: " + ", ".join(sin_foto[:5]) + ".")
+            hechas_b = st.session_state.get("pr_hechas") or []
+            if hechas_b:
+                if len(hechas_b) > 1:
+                    import zipfile
+                    zbuf = io.BytesIO()
+                    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
+                        for n, b in hechas_b:
+                            z.writestr(n, b)
+                    st.download_button(f"⬇️ Descargar las {len(hechas_b)} imágenes (.zip)",
+                                       zbuf.getvalue(), "lyhoshop-estados.zip",
+                                       "application/zip", type="primary", key="pr_zip")
+                cols_p = st.columns(min(len(hechas_b), 3))
+                for i, (n, b) in enumerate(hechas_b):
+                    with cols_p[i % len(cols_p)]:
+                        st.image(b, width="stretch")
+                        st.download_button("⬇️ Descargar", b, n, "image/png", key=f"pr_dl_{i}",
+                                           width="stretch")
+                st.caption("En el teléfono: descarga y súbela a tu estado o historia. El enlace "
+                           "que aparece abajo de la imagen lleva directo al producto.")
+        with t_enl:
+            st.caption("Cada producto tiene su dirección. Al compartirla por WhatsApp, Instagram "
+                       "o Facebook aparece su foto, nombre y precio, y al tocarla abre el "
+                       "catálogo con ese producto destacado.")
+            enl = visibles_p[["NOMBRE", "PRECIO_VENTA", "EXISTENCIA", "CON_FOTO"]].copy()
+            enl["ENLACE"] = base_url + "/p/" + enl["NOMBRE"].map(slug)
+            enl = enl.sort_values("NOMBRE")
+            buscar_e = st.text_input("Buscar", placeholder="anillo, collar…", key="pr_buscar")
+            if buscar_e:
+                enl = enl[enl["NOMBRE"].str.contains(buscar_e.strip().upper(), regex=False)]
+            st.dataframe(
+                enl, hide_index=True, width="stretch", height=380,
+                column_order=["NOMBRE", "ENLACE", "PRECIO_VENTA", "EXISTENCIA", "CON_FOTO"],
+                column_config={
+                    "NOMBRE": "Producto",
+                    "ENLACE": st.column_config.LinkColumn("Enlace (toca para abrir)"),
+                    "PRECIO_VENTA": st.column_config.NumberColumn("Precio", format="$%.2f"),
+                    "EXISTENCIA": st.column_config.NumberColumn("Quedan", format="%d"),
+                    "CON_FOTO": st.column_config.CheckboxColumn("Foto"),
+                })
+            una = st.selectbox("Texto listo para un estado", list(enl["NOMBRE"]), index=None,
+                               placeholder="Elige un producto", key="pr_texto")
+            if una:
+                r = enl[enl["NOMBRE"] == una].iloc[0]
+                st.code(f"✨ {una.title()} · {money(r['PRECIO_VENTA'])}\n"
+                        f"Pídelo aquí 👉 {r['ENLACE']}", language=None)
+                st.caption("Toca el ícono de copiar (arriba a la derecha del recuadro).")
+
 elif seccion == "🎁 Por cobrar":
     st.header("Encargos y préstamos")
     st.caption("Encargo: compras algo para alguien y le cobras más de lo que te costó. "

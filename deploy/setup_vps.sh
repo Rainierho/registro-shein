@@ -110,8 +110,26 @@ Environment=STREAMLIT_THEME_BACKGROUND_COLOR=#EEEDE9
 Environment=STREAMLIT_THEME_SECONDARY_BACKGROUND_COLOR=#FFFFFF
 Environment=STREAMLIT_THEME_TEXT_COLOR=#2E3B42
 TEMA
+# Vistas previas de cada producto (lyhoshop.com/p/...) para WhatsApp e Instagram
+cat > /etc/systemd/system/lyho-enlaces.service <<UNIT
+[Unit]
+Description=Lyho Shop · vistas previas de productos (lyhoshop.com/p/...)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=$USUARIO
+WorkingDirectory=$DIR
+ExecStart=$DIR/.venv/bin/python enlaces.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+UNIT
 systemctl daemon-reload
-systemctl enable lyho-app lyho-catalogo >/dev/null 2>&1
+systemctl enable lyho-app lyho-catalogo lyho-enlaces >/dev/null 2>&1
 
 paso "Comando 'lyho-deploy' para actualizar desde GitHub"
 cat > /usr/local/bin/lyho-deploy <<DEPLOY
@@ -124,9 +142,9 @@ if [ -f $DIR/.streamlit/secrets.toml ]; then
     chown $USUARIO:$USUARIO $DIR/.streamlit/secrets.toml
     chmod 600 $DIR/.streamlit/secrets.toml
 fi
-systemctl restart lyho-app lyho-catalogo
+systemctl restart lyho-app lyho-catalogo lyho-enlaces
 sleep 4
-for s in lyho-app lyho-catalogo; do
+for s in lyho-app lyho-catalogo lyho-enlaces; do
     printf '%-14s %s\n' "\$s" "\$(systemctl is-active \$s)"
 done
 DEPLOY
@@ -154,7 +172,7 @@ paso "Secrets"
 SECRETS="$DIR/.streamlit/secrets.toml"
 if [ -f "$SECRETS" ]; then
     chown "$USUARIO:$USUARIO" "$SECRETS"; chmod 600 "$SECRETS"
-    systemctl restart lyho-app lyho-catalogo
+    systemctl restart lyho-app lyho-catalogo lyho-enlaces
     sleep 5
     echo "    secrets encontrados; apps reiniciadas"
 else
@@ -163,9 +181,12 @@ else
 fi
 
 paso "Estado"
-for s in lyho-app lyho-catalogo cloudflared; do
+for s in lyho-app lyho-catalogo lyho-enlaces cloudflared; do
     printf '    %-14s %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null || true)"
 done
+if curl -fs -o /dev/null "http://127.0.0.1:8503/p/"; then
+    echo "    puerto 8503 (vistas previas) responde"
+fi
 for p in 8501 8502; do
     if curl -fs -o /dev/null "http://127.0.0.1:$p/_stcore/health"; then
         echo "    puerto $p responde"

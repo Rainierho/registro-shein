@@ -380,13 +380,200 @@ FOTOS_PROPIAS = (cargar_fotos(BACKEND, secreto("spreadsheet_id") or secreto("exc
                  if disp["FOTOS_L"].map(lambda l: any(not r.startswith("http") for r in l)).any()
                  else {})
 
+# ---------------------------------------------------------------------------
+# Etiquetas «Nuevo» y «Más vendido», y dirección de cada producto
+# ---------------------------------------------------------------------------
+from comun import slug
+
+
+def _fecha(v):
+    """Fecha del Sheet (texto o número de serie de Sheets/Excel) -> Timestamp o NaT."""
+    if v is None or str(v).strip() == "":
+        return pd.NaT
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return pd.Timestamp("1899-12-30") + pd.Timedelta(days=float(v))
+    s = str(v).strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}", s):
+        return pd.to_datetime(s[:10], errors="coerce")
+    return pd.to_datetime(s, errors="coerce", dayfirst=True)
+
+
+HOY = pd.Timestamp.now(tz="America/Caracas").tz_localize(None).normalize()
+disp["SLUG"] = disp["NOMBRE"].map(slug)
+nuevo = pd.Series(False, index=disp.index)
+if len(lotes) and {"LOTE", "LLEGADA"} <= set(lotes.columns):
+    llegada = {_num(l_): _fecha(f_) for l_, f_ in zip(lotes["LOTE"], lotes["LLEGADA"])}
+    fechas = pd.to_datetime(disp["LOTE_N"].map(llegada), errors="coerce")
+    nuevo = fechas.notna() & ((HOY - fechas).dt.days.between(0, 15))
+if not nuevo.any() and disp["LOTE_N"].nunique() > 1:      # sin fechas: el lote más reciente
+    nuevo = disp["LOTE_N"] == disp["LOTE_N"].max()
+disp["NUEVO"] = nuevo
+disp["MAS_VENDIDO"] = False
+if len(ven) and {"NOMBRE", "FECHA"} <= set(ven.columns):
+    f_ven = ven["FECHA"].map(_fecha)
+    recientes = ven[(HOY - f_ven).dt.days.between(0, 60)]
+    cuenta = recientes["NOMBRE"].astype(str).str.strip().value_counts()
+    top = [n for n in cuenta.index if cuenta[n] >= 3 and n in set(disp["NOMBRE"])][:5]
+    disp["MAS_VENDIDO"] = disp["NOMBRE"].isin(top)
+
+# ---------------------------------------------------------------------------
+# Carrito: el cliente junta varios productos y manda un solo WhatsApp
+# ---------------------------------------------------------------------------
+QUEDAN_DE = dict(zip(disp["NOMBRE"], disp["QUEDAN"]))
+PRECIO_DE = dict(zip(disp["NOMBRE"], disp["PRECIO"]))
+carrito = st.session_state.setdefault("carrito", {})
+for _n in list(carrito):                       # lo que ya no está, o pidió de más
+    if _n not in QUEDAN_DE:
+        carrito.pop(_n)
+    else:
+        carrito[_n] = min(carrito[_n], int(QUEDAN_DE[_n]))
+
+
+def sumar(nombre, d=1):
+    c = st.session_state["carrito"]
+    q = c.get(nombre, 0) + d
+    if q <= 0:
+        c.pop(nombre, None)
+    else:
+        c[nombre] = min(q, int(QUEDAN_DE.get(nombre, q)))
+
+
+def vaciar():
+    st.session_state["carrito"] = {}
+
+
+def total_carrito():
+    return sum(PRECIO_DE[n] * q for n, q in carrito.items())
+
+
+def mensaje_pedido():
+    lineas = [f"¡Hola! Quiero hacer este pedido en {NOMBRE}:"]
+    for n, q in carrito.items():
+        lineas.append(f"• {q} × {n.title()} — {ve(PRECIO_DE[n] * q, '$')}")
+    tot = total_carrito()
+    lineas.append(f"*Total: {ve(tot, '$')}*" + (f" ({ve(tot * TASA_USDT, 'Bs')})" if TASA_USDT else ""))
+    return "\n".join(lineas)
+
+
+def msg_producto(p):
+    ref = ve(p["PRECIO"], "$") + (f" / {ve(p['PRECIO'] * TASA_USDT, 'Bs')}" if TASA_USDT else "")
+    return f"¡Hola! Me interesa *{p['NOMBRE'].title()}* ({ref}) que vi en el catálogo."
+
+
+def etiquetas(p):
+    chips = ""
+    if p["NUEVO"]:
+        chips += '<span class="lyho-chip nuevo">✨ Nuevo</span> '
+    if p["MAS_VENDIDO"]:
+        chips += '<span class="lyho-chip top">⭐ Más vendido</span> '
+    if p["QUEDAN"] == 1:
+        chips += '<span class="lyho-chip">🔥 ¡Última unidad!</span>'
+    elif p["QUEDAN"] <= 2:
+        chips += '<span class="lyho-chip">Quedan pocas</span>'
+    elif not chips:
+        chips += '<span class="lyho-chip ok">Disponible</span>'
+    return chips
+
+
+def fotos_producto(p, alto):
+    fuentes = [f for f in (fuente_foto(r, p["NOMBRE"]) for r in p["FOTOS_L"]) if f]
+    if len(fuentes) > 1:
+        pasarela(fuentes, alto=alto)
+    elif fuentes:
+        f0 = fuentes[0]
+        if f0.startswith("data:"):
+            f0 = base64.b64decode(f0.split(",", 1)[1])
+        st.image(f0, width="stretch")
+
+
+def boton_carrito(p, key):
+    q = carrito.get(p["NOMBRE"], 0)
+    agotado = q >= p["QUEDAN"]
+    etiqueta = ("🛒 Agregar" if not q else
+                (f"✓ {q} en tu pedido" if agotado else f"✓ {q} en tu pedido · ➕"))
+    st.button(etiqueta, key=key, on_click=sumar, args=(p["NOMBRE"],), disabled=agotado,
+              type="secondary" if q else "primary", width="stretch")
+
+
+def css_extra():
+    st.markdown("""<style>
+.lyho-chip.nuevo{background:rgba(90,151,172,.18);color:#3F7184}
+.lyho-chip.top{background:#AE5166;color:#fff}
+.lyho-directo{font-size:.78rem;text-align:center;margin-top:2px}
+.lyho-directo a{color:#5A97AC!important;text-decoration:none}
+[class*="st-key-tarjeta_"] [data-testid="stBaseButton-primary"],
+.st-key-detalle [data-testid="stBaseButton-primary"]{background:#AE5166!important;border-color:#AE5166!important;
+  color:#fff!important;border-radius:999px!important;font-weight:700}
+[class*="st-key-tarjeta_"] [data-testid="stBaseButton-secondary"],
+.st-key-detalle [data-testid="stBaseButton-secondary"]{border-radius:999px!important;border-color:#AE5166!important;
+  color:#AE5166!important;font-weight:700;background:#fff!important}
+.st-key-detalle{background:#fff;border:1px solid rgba(174,81,102,.16);border-radius:18px;padding:14px;
+  box-shadow:0 4px 14px rgba(46,59,66,.10);margin-bottom:8px}
+.st-key-detalle h2{color:#2E3B42;margin:0}
+.st-key-carrito{background:#fff;border:2px solid #F7AEC2;border-radius:16px;padding:10px 12px}
+.st-key-carrito [data-testid="stHorizontalBlock"]{flex-wrap:nowrap!important;align-items:center}
+.st-key-carrito [data-testid="stColumn"]{min-width:0!important}
+.lyho-linea{font-size:.9rem;color:#2E3B42}
+.lyho-total{color:#AE5166;font-weight:800;font-size:1.15rem}
+</style>""", unsafe_allow_html=True)
+
+
+css_extra()
 cabecera(len(disp))
 
 if disp.empty:
     st.info("Por ahora no hay productos disponibles. ¡Vuelve pronto!")
     st.stop()
 
-ORDENES = ["Recomendados", "Menor precio", "Mayor precio", "Nombre"]
+# --- producto destacado: llegaron desde un enlace lyhoshop.com/p/... ---
+elegido = str(st.query_params.get("p", "")).strip().lower()
+if elegido:
+    fila = disp[disp["SLUG"] == elegido]
+    if fila.empty:
+        st.info("Ese producto ya no está disponible. Mira lo que tenemos 👇")
+    else:
+        p = fila.iloc[0]
+        with st.container(key="detalle"):
+            c = st.columns([1, 1]) if not MOVIL else [st.container(), st.container()]
+            with c[0]:
+                fotos_producto(p, 380 if not MOVIL else 300)
+            with c[1]:
+                st.markdown(f"<h2>{_html.escape(p['NOMBRE'].title())}</h2>"
+                            f"<div>{etiquetas(p)}</div>", unsafe_allow_html=True)
+                if str(p["DESCRIPCION"]).strip():
+                    st.markdown(f'<div class="lyho-desc">{_html.escape(str(p["DESCRIPCION"]))}</div>',
+                                unsafe_allow_html=True)
+                st.markdown(f'<div class="lyho-precio">{ve(p["PRECIO"], "$")}</div>'
+                            + (f'<div class="lyho-bs">{ve(p["PRECIO"] * TASA_USDT, "Bs")}</div>'
+                               if TASA_USDT else ""), unsafe_allow_html=True)
+                boton_carrito(p, "add_detalle")
+                if WHATSAPP:
+                    st.link_button("📲 Lo quiero por WhatsApp",
+                                   f"https://wa.me/{WHATSAPP}?text={quote(msg_producto(p))}",
+                                   width="stretch")
+                if st.button("← Ver todo el catálogo", key="ver_todo", width="stretch"):
+                    st.query_params.clear()
+                    st.rerun()
+
+# --- el pedido armado ---
+if carrito:
+    with st.container(key="carrito"):
+        n_art = sum(carrito.values())
+        st.markdown(f"**🛒 Tu pedido** · {n_art} {'artículo' if n_art == 1 else 'artículos'}")
+        for i, (n, q) in enumerate(list(carrito.items())):
+            c = st.columns([6, 1, 1])
+            c[0].markdown(f'<div class="lyho-linea">{q} × {_html.escape(n.title())} — '
+                          f'<b>{ve(PRECIO_DE[n] * q, "$")}</b></div>', unsafe_allow_html=True)
+            c[1].button("➖", key=f"menos_{i}", on_click=sumar, args=(n, -1))
+            c[2].button("➕", key=f"mas_{i}", on_click=sumar, args=(n, 1),
+                        disabled=q >= QUEDAN_DE.get(n, q))
+        tot = total_carrito()
+        st.markdown(f'<div class="lyho-total">Total: {ve(tot, "$")}'
+                    + (f' · {ve(tot * TASA_USDT, "Bs")}' if TASA_USDT else "") + "</div>",
+                    unsafe_allow_html=True)
+        st.button("Vaciar pedido", key="vaciar", on_click=vaciar)
+
+ORDENES = ["Recomendados", "Novedades", "Más vendidos", "Menor precio", "Mayor precio", "Nombre"]
 if MOVIL:
     busq = st.text_input("Buscar", placeholder="🔎 Buscar: anillo, collar, reloj…",
                          label_visibility="collapsed").strip().lower()
@@ -405,14 +592,20 @@ if busq:
           | v["DESCRIPCION"].astype(str).str.lower().str.contains(busq, regex=False)]
 if tipos:
     v = v[v["TIPO"].isin(tipos)]
-if orden == "Menor precio":
+v = v.assign(_sin_foto=v["FOTOS_L"].map(len) == 0)
+if orden == "Novedades":
+    v = v.sort_values(["NUEVO", "LOTE_N", "_sin_foto"], ascending=[False, False, True])
+elif orden == "Más vendidos":
+    v = v.assign(_vend=v["NOMBRE"].map(vendidas).fillna(0)).sort_values("_vend", ascending=False)
+elif orden == "Menor precio":
     v = v.sort_values("PRECIO")
 elif orden == "Mayor precio":
     v = v.sort_values("PRECIO", ascending=False)
 elif orden == "Nombre":
     v = v.sort_values("NOMBRE")
-else:   # primero los que tienen foto, luego los que quedan pocos
-    v = v.assign(_f=v["FOTOS_L"].map(len) == 0).sort_values(["_f", "QUEDAN"])
+else:   # con foto primero; dentro, lo nuevo y lo más vendido; luego lo que queda poco
+    v = v.sort_values(["_sin_foto", "NUEVO", "MAS_VENDIDO", "QUEDAN"],
+                      ascending=[True, False, False, True])
 
 if v.empty:
     st.info("No hay productos con esa búsqueda.")
@@ -421,36 +614,22 @@ if v.empty:
 
 def tarjeta(p, k):
     with st.container(key=f"tarjeta_{k}"):
-        fuentes = [f for f in (fuente_foto(r, p["NOMBRE"]) for r in p["FOTOS_L"]) if f]
-        if len(fuentes) > 1:
-            pasarela(fuentes, alto=ALTO_FOTO)
-        elif fuentes:
-            f0 = fuentes[0]
-            if f0.startswith("data:"):
-                f0 = base64.b64decode(f0.split(",", 1)[1])
-            st.image(f0, width="stretch")
-        nombre = _html.escape(p["NOMBRE"].title())
+        fotos_producto(p, ALTO_FOTO)
+        bloque = f'<div class="lyho-nom">{_html.escape(p["NOMBRE"].title())}</div>'
         desc = str(p["DESCRIPCION"]).strip()
-        bloque = f'<div class="lyho-nom">{nombre}</div>'
         if desc and not MOVIL:
             corto = desc[:110] + ("…" if len(desc) > 110 else "")
             bloque += f'<div class="lyho-desc">{_html.escape(corto)}</div>'
         bloque += f'<div class="lyho-precio">{ve(p["PRECIO"], "$")}</div>'
         if TASA_USDT:
             bloque += f'<div class="lyho-bs">{ve(p["PRECIO"] * TASA_USDT, "Bs")}</div>'
-        if p["QUEDAN"] == 1:
-            bloque += '<span class="lyho-chip">🔥 ¡Última unidad!</span>'
-        elif p["QUEDAN"] <= 2:
-            bloque += '<span class="lyho-chip">Quedan pocas</span>'
-        else:
-            bloque += '<span class="lyho-chip ok">Disponible</span>'
+        bloque += f"<div>{etiquetas(p)}</div>"
         st.markdown(bloque, unsafe_allow_html=True)
+        boton_carrito(p, f"add_{k}")
         if WHATSAPP:
-            ref = ve(p["PRECIO"], "$") + (f" / {ve(p['PRECIO'] * TASA_USDT, 'Bs')}"
-                                           if TASA_USDT else "")
-            msg = f"¡Hola! Me interesa *{p['NOMBRE'].title()}* ({ref}) que vi en el catálogo."
-            st.link_button("📲 Lo quiero", f"https://wa.me/{WHATSAPP}?text={quote(msg)}",
-                           type="primary", width="stretch")
+            st.markdown(f'<div class="lyho-directo"><a href="https://wa.me/{WHATSAPP}?text='
+                        f'{quote(msg_producto(p))}" target="_blank">o pídelo directo 📲</a></div>',
+                        unsafe_allow_html=True)
 
 
 por_fila = 2 if MOVIL else 3
@@ -466,6 +645,13 @@ with st.container(key="grilla"):
 st.markdown('<div class="lyho-pie">Las existencias se actualizan cada pocos minutos. '
             "Escríbenos para confirmar tu pedido.</div>", unsafe_allow_html=True)
 if WHATSAPP:
-    hola = quote("¡Hola! Vi tu catálogo y quiero hacer un pedido.")
-    st.markdown(f'<a class="lyho-flot" href="https://wa.me/{WHATSAPP}?text={hola}" '
-                'target="_blank">💬 Pedir por WhatsApp</a>', unsafe_allow_html=True)
+    if carrito:
+        n_art = sum(carrito.values())
+        texto_flot = f"💬 Enviar pedido · {n_art} · {ve(total_carrito(), '$')}"
+        enlace_flot = f"https://wa.me/{WHATSAPP}?text={quote(mensaje_pedido())}"
+    else:
+        texto_flot = "💬 Pedir por WhatsApp"
+        enlace_flot = (f"https://wa.me/{WHATSAPP}?text="
+                       + quote("¡Hola! Vi tu catálogo y quiero hacer un pedido."))
+    st.markdown(f'<a class="lyho-flot" href="{enlace_flot}" target="_blank">'
+                f"{_html.escape(texto_flot)}</a>", unsafe_allow_html=True)
