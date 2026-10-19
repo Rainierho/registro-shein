@@ -1213,6 +1213,25 @@ if (BACKEND == "gsheets" and secreto("backup_spreadsheet_id")
     except Exception as e:
         st.session_state["respaldo_error"] = f"{type(e).__name__}: {e}"
 
+# tasa para expresar en dólares lo que está en bolívares (caja, deudas y gastos).
+# Por defecto USDT: es lo que de verdad obtienes si cambias tus bolívares.
+VALOR_BS = str(_cfg.get("VALOR_BS") or "USDT").strip().upper()
+VALOR_BS_TASA = leer_monto(_cfg.get("VALOR_BS_TASA")) or None
+
+
+def tasa_de_valor():
+    if VALOR_BS == "BCV" and TASA:
+        return TASA, "BCV"
+    if VALOR_BS == "OTRA" and VALOR_BS_TASA:
+        return VALOR_BS_TASA, "tasa propia"
+    t_u = tasa_usdt()
+    if t_u:
+        return t_u, "USDT"
+    return TASA, "BCV, porque USDT no está disponible ahora"
+
+
+TASA_VAL, TASA_VAL_NOMBRE = tasa_de_valor()
+
 LOTES = leer("LOTES")
 EN_CAMINO = set(pd.to_numeric(
     LOTES.loc[LOTES["ESTADO"].astype(str).str.upper() == "EN CAMINO", "LOTE"],
@@ -1221,10 +1240,10 @@ LLEGADAS = dict(zip(pd.to_numeric(LOTES["LOTE"], errors="coerce"), LOTES["LLEGAD
 INV = inventario_calculado(inv_raw, ven_raw)
 INV["EN_CAMINO"] = INV["LOTE"].isin(EN_CAMINO)
 VEN = ventas_calculadas(ven_raw, inv_raw)
-ENC = encargos_calculados(enc, TASA)
-CAJA = caja_calculada(caja, TASA)
+ENC = encargos_calculados(enc, TASA_VAL)
+CAJA = caja_calculada(caja, TASA_VAL)
 gas = leer("GASTOS")
-GAS = gastos_calculados(gas, TASA)
+GAS = gastos_calculados(gas, TASA_VAL)
 contactos = leer("CONTACTOS")
 TELEFONOS = dict(zip(contactos["PERSONA"].astype(str).str.upper(), contactos["TELEFONO"]))
 MSG_COBRO = str(_cfg.get("MSG_COBRO") or "") or MSG_COBRO_DEFECTO
@@ -1274,8 +1293,31 @@ with st.sidebar:
             st.rerun()
         else:
             st.error(f"No se pudo traer ({_fuente}). Cárgala a mano.")
-    if not TASA and (CAJA["MONEDA"].eq("Bs").any() or ENC["MONEDA"].eq("Bs").any()
-                     or GAS["MONEDA"].eq("Bs").any()):
+    st.caption("Valorar bolívares a · caja, deudas y gastos en $")
+    with st.form("form_valor_bs", clear_on_submit=False, border=False):
+        _t_u = tasa_usdt()
+        _ops = {"USDT": f"USDT · {plata(_t_u, 'Bs')}" if _t_u else "USDT (sin conexión)",
+                "BCV": f"BCV · {plata(TASA, 'Bs')}" if TASA else "BCV (sin tasa)",
+                "OTRA": "Otra tasa"}
+        _elegido = st.selectbox("Valorar bolívares a", list(_ops), format_func=_ops.get,
+                                index=list(_ops).index(VALOR_BS) if VALOR_BS in _ops else 0,
+                                label_visibility="collapsed")
+        _otra = st.text_input("Tasa propia", value=fmt_monto(VALOR_BS_TASA),
+                              placeholder="Bs por $, solo para «Otra tasa»",
+                              label_visibility="collapsed")
+        if st.form_submit_button("Aplicar", width="stretch"):
+            _n = leer_monto(_otra)
+            if _elegido == "OTRA" and not (_n and _n > 0):
+                st.error("Escribe la tasa (Bs por $) para «Otra tasa».")
+            else:
+                set_config(VALOR_BS=_elegido,
+                           VALOR_BS_TASA=_n if _elegido == "OTRA" else (VALOR_BS_TASA or ""))
+                avisar(f"Bolívares valorados a {_ops[_elegido]}.")
+                st.rerun()
+    if TASA_VAL:
+        st.caption(f"Ahora: 1 $ = {plata(TASA_VAL, 'Bs')} ({TASA_VAL_NOMBRE})")
+    if not TASA_VAL and (CAJA["MONEDA"].eq("Bs").any() or ENC["MONEDA"].eq("Bs").any()
+                         or GAS["MONEDA"].eq("Bs").any()):
         st.warning("Hay montos en bolívares y no hay tasa: no se suman a los totales.",
                    icon="💱")
     st.divider()
@@ -1544,8 +1586,8 @@ if seccion == "📊 Dashboard":
     if sin_tasa_n:
         nota += (f" {sin_tasa_n} montos en bolívares quedaron fuera porque no hay tasa del "
                  "día cargada.")
-    elif TASA:
-        nota += f" Bolívares convertidos a {TASA:,.2f} Bs/$."
+    elif TASA_VAL:
+        nota += f" Bolívares convertidos a {TASA_VAL:,.2f} Bs/$ ({TASA_VAL_NOMBRE})."
     if sin_costo_enc:
         nota += (f" Ojo: {sin_costo_enc} encargos ({money(monto_sin_costo)}) no tienen el costo "
                  "anotado, así que esa parte no se puede repartir.")
@@ -3101,7 +3143,8 @@ elif seccion == "💵 Caja Chica":
     k[0].metric("Total en dólares", money(total_usd))
     bs = CAJA[CAJA["MONEDA"] == "Bs"]
     k[1].metric("En bolívares", plata(bs["MONTO"].sum(), "Bs"),
-                f"≈ {money(bs['MONTO_USD'].sum())}" if len(bs) and TASA else None)
+                f"≈ {money(bs['MONTO_USD'].sum())} a {TASA_VAL_NOMBRE}"
+                if len(bs) and TASA_VAL else None)
     k[2].metric("Ubicaciones", len(CAJA))
     if CAJA["MONTO_USD"].isna().any():
         st.warning("Hay ubicaciones en bolívares que no entran al total: falta la tasa del "
