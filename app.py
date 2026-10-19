@@ -1061,14 +1061,78 @@ def selector_caja(cont, etiqueta, key, mover_por_defecto=True):
     return None if v == NO_MOVER else v
 
 
-def plan_caja(ubic, monto, moneda="$"):
-    """Valida un movimiento antes de guardar nada.
+COBRO_EXACTO = "Monto exacto en Bs"
+COBRO_OTRA = "Otra tasa"
+
+
+def moneda_de(ubic):
+    fila = CAJA[CAJA["UBICACION"] == ubic]
+    return moneda_norm(fila["MONEDA"]).iloc[0] if len(fila) else "$"
+
+
+def hay_caja_bs():
+    return bool(len(CAJA)) and (moneda_norm(CAJA["MONEDA"]) == "Bs").any()
+
+
+def opciones_cobro_bs():
+    """Tasas para cobrar en bolívares: primero USDT (la del catálogo), luego BCV."""
+    ops = {}
+    t_u = tasa_usdt()
+    if t_u:
+        ops[f"USDT · {plata(t_u, 'Bs')}"] = t_u
+    if TASA:
+        ops[f"BCV · {plata(TASA, 'Bs')}"] = TASA
+    ops[COBRO_OTRA] = None
+    ops[COBRO_EXACTO] = None
+    return ops
+
+
+def campos_cobro_bs(cont, key, que="cobraste"):
+    """Dos campos para cuando la plata entra o sale en bolívares: a qué tasa, o el monto
+    exacto. Funcionan dentro de un formulario; si la ubicación es en $, se ignoran."""
+    ops = opciones_cobro_bs()
+    c = cont.columns([3, 2])
+    elegido = c[0].selectbox(f"Si fue en bolívares, ¿a qué tasa {que}?", list(ops), key=f"{key}_t",
+                             help="Por defecto USDT, la misma del catálogo.")
+    texto = c[1].text_input("Tasa o Bs exactos", key=f"{key}_v",
+                            placeholder="solo si elegiste «Otra tasa» o «Monto exacto»",
+                            help="Con «Otra tasa», escribe cuántos Bs por dólar. Con «Monto "
+                                 "exacto», los Bs que entraron en total.")
+    return ops, elegido, texto
+
+
+def plan_caja_bs(ubic, monto_usd, cobro):
+    """Como plan_caja, pero si la ubicación es en Bs usa la tasa (o el monto) elegidos al
+    cobrar. Devuelve (delta, moneda, error, nota para la bitácora)."""
+    if not ubic or moneda_de(ubic) != "Bs" or cobro is None:
+        d, mon, err = plan_caja(ubic, monto_usd)
+        return d, mon, err, ""
+    ops, elegido, texto = cobro
+    signo = -1 if monto_usd < 0 else 1
+    if elegido == COBRO_EXACTO:
+        bs = leer_monto(texto)
+        if not bs or bs <= 0:
+            return None, "Bs", f"Escribe los Bs que entraron en «Tasa o Bs exactos» (leí «{texto}»).", ""
+        d, mon, err = plan_caja(ubic, signo * bs, "Bs")
+        return d, mon, err, f" · {plata(bs, 'Bs')} exactos (tasa {plata(bs / abs(monto_usd), 'Bs')})"
+    tasa = ops.get(elegido) if elegido != COBRO_OTRA else leer_monto(texto)
+    if not tasa or tasa <= 0:
+        return None, "Bs", (f"Escribe la tasa en «Tasa o Bs exactos» (leí «{texto}»)."
+                            if elegido == COBRO_OTRA else
+                            "No hay tasa disponible: elige «Otra tasa» o «Monto exacto»."), ""
+    d, mon, err = plan_caja(ubic, monto_usd, "$", tasa)
+    return d, mon, err, f" · tasa {plata(tasa, 'Bs')}"
+
+
+def plan_caja(ubic, monto, moneda="$", tasa=None):
+    """Valida un movimiento antes de guardar nada. `tasa` es la tasa con la que de verdad
+    se cobró o pagó (USDT, BCV u otra); si no se da, se usa la BCV del día.
     Devuelve (delta en la moneda de la ubicación, moneda de la ubicación, error)."""
     if not ubic or abs(monto) < 0.0001:
         return 0.0, None, None
     fila = CAJA[CAJA["UBICACION"] == ubic]
     mon_u = fila["MONEDA"].iloc[0] if len(fila) else "$"
-    delta = convertir(monto, moneda, mon_u, TASA)
+    delta = convertir(monto, moneda, mon_u, tasa or TASA)
     if delta is None:
         return None, mon_u, (f"{ubic} está en bolívares y no hay tasa del día. "
                              "Cárgala en la barra lateral.")
@@ -1515,9 +1579,10 @@ elif seccion == "🧾 Ventas":
                 fecha = c[2].date_input("Fecha", value=hoy(), format="DD/MM/YYYY")
                 lote = c[3].number_input("Lote", min_value=0, step=1, value=0)
                 ubic = selector_caja(st, "¿Dónde entró la plata?", "caja_venta_libre")
+                cobro = campos_cobro_bs(st, "cobro_libre") if hay_caja_bs() else None
                 if st.form_submit_button("Guardar venta", type="primary"):
                     monto = leer_monto(monto_txt)
-                    delta, _, err = plan_caja(ubic, monto or 0)
+                    delta, _, err, nota = plan_caja_bs(ubic, monto or 0, cobro)
                     if not nombre:
                         st.error("Falta el nombre del producto.")
                     elif monto is None or monto <= 0:
@@ -1527,7 +1592,7 @@ elif seccion == "🧾 Ventas":
                     else:
                         agregar("VENTAS", {"NOMBRE": nombre, "MONTO": monto,
                                            "FECHA": pd.Timestamp(fecha), "LOTE": lote or None})
-                        extra = aplicar_caja(ubic, delta, "Venta", nombre)
+                        extra = aplicar_caja(ubic, delta, "Venta", nombre + nota)
                         avisar(f"Venta registrada: {nombre} · {money(monto)}.{extra}")
                         st.rerun()
         elif disponibles.empty:
@@ -1550,9 +1615,11 @@ elif seccion == "🧾 Ventas":
                                          value=_ent(prod["LOTE"]), key=f"lote_venta_{nombre}")
                 cantidad = c[3].number_input("Unidades", min_value=1, step=1, value=1)
                 ubic = selector_caja(st, "¿Dónde entró la plata?", "caja_venta")
+                cobro = campos_cobro_bs(st, "cobro_venta") if hay_caja_bs() else None
                 enviado = st.form_submit_button("Guardar venta", type="primary")
                 monto = leer_monto(monto_txt)
-                delta, _, err = plan_caja(ubic, (monto or 0) * int(cantidad))
+                delta, _, err, nota = (plan_caja_bs(ubic, (monto or 0) * int(cantidad), cobro)
+                                       if enviado else (0.0, None, None, ""))
                 if enviado and (monto is None or monto <= 0):
                     st.error(f"Monto inválido: «{monto_txt}». Escribe por ejemplo 5 o 5,50.")
                 elif enviado and int(cantidad) > _ent(prod["EXISTENCIA"]):
@@ -1564,7 +1631,7 @@ elif seccion == "🧾 Ventas":
                         "NOMBRE": nombre, "MONTO": monto,
                         "FECHA": pd.Timestamp(fecha), "LOTE": lote or None,
                     }] * int(cantidad))
-                    extra = aplicar_caja(ubic, delta, "Venta", f"{nombre} x{int(cantidad)}")
+                    extra = aplicar_caja(ubic, delta, "Venta", f"{nombre} x{int(cantidad)}{nota}")
                     avisar(f"{int(cantidad)} venta(s) de {nombre} · "
                            f"{money(monto * cantidad)}.{extra}")
                     st.rerun()
@@ -1618,10 +1685,15 @@ elif seccion == "🧾 Ventas":
                                  "caja_borrar_ven", mover_por_defecto=False)
             st.caption("Si al registrarla movió la caja, elige la misma ubicación para "
                        "revertirlo. Si fue un duplicado que nunca entró, deja «No mover».")
+            cobro = None
+            if ubic and moneda_de(ubic) == "Bs":
+                st.caption("Para devolver los mismos bolívares que entraron, elige la tasa con "
+                           "la que cobraste. La bitácora de Caja Chica la muestra en el detalle.")
+                cobro = campos_cobro_bs(st, "cobro_borrar", que="la cobraste")
             conf = st.checkbox("Sí, quiero borrar esta venta", key="conf_borrar_ven")
             if st.button("🗑️ Eliminar venta", disabled=not conf, key="btn_borrar_ven"):
                 monto_v = _num(ven_raw.loc[ops[elegida], "MONTO"])
-                delta, _, err = plan_caja(ubic, -monto_v)
+                delta, _, err, _nota = plan_caja_bs(ubic, -monto_v, cobro)
                 if err:
                     st.error(err)
                 else:
