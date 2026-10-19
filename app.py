@@ -36,6 +36,7 @@ TABS = {
     "CONTACTOS": ["PERSONA", "TELEFONO"],
     "LOTES": ["LOTE", "ESTADO", "LLEGADA"],
     "FOTOS": ["NOMBRE", "IMG", "ID"],
+    "FINANZAS_HIST": ["FECHA", "CAJA", "POR_COBRAR", "INVENTARIO", "TOTAL"],
     "VENTAS_HIST": ["NOMBRE", "MONTO", "FECHA", "LOTE"],
     "INVENTARIO_HIST": ["NOMBRE", "SKU", "PROPIETARIO", "TALLA", "CANTIDAD", "PRECIO_COMPRA",
                         "PRECIO_VENTA", "TIPO", "CATEGORIA", "LOTE", "FECHA_LOTE"],
@@ -54,6 +55,7 @@ NUMERICAS = {
     "GASTOS": ["MONTO", "LOTE"],
     "MOVIMIENTOS": ["MONTO", "SALDO"],
     "LOTES": ["LOTE"],
+    "FINANZAS_HIST": ["CAJA", "POR_COBRAR", "INVENTARIO", "TOTAL"],
     "VENTAS_HIST": ["MONTO", "LOTE"],
     "INVENTARIO_HIST": ["CANTIDAD", "PRECIO_COMPRA", "PRECIO_VENTA", "LOTE"],
 }
@@ -62,11 +64,12 @@ DINERO = {"MONTO", "PRECIO_COMPRA", "PRECIO_VENTA", "BOLOS", "TASA", "COSTO", "C
           "ABONADO", "SALDO"}
 FECHAS = {"VENTAS": ["FECHA"], "ENCARGOS": ["FECHA", "ULT_ABONO"], "GASTOS": ["FECHA"],
           "MOVIMIENTOS": ["FECHA"], "LOTES": ["LLEGADA"], "VENTAS_HIST": ["FECHA"],
+          "FINANZAS_HIST": ["FECHA"],
           "INVENTARIO_HIST": ["FECHA_LOTE"]}
 CLAVES = {"INVENTARIO": "NOMBRE", "VENTAS": "NOMBRE", "DEUDAS": "DEUDOR", "CAJA": "UBICACION",
           "ENCARGOS": "PERSONA", "CONFIG": "CLAVE", "GASTOS": "CATEGORIA",
           "MOVIMIENTOS": "UBICACION", "CONTACTOS": "PERSONA", "LOTES": "LOTE",
-          "FOTOS": "NOMBRE",
+          "FOTOS": "NOMBRE", "FINANZAS_HIST": "FECHA",
           "VENTAS_HIST": "NOMBRE",
           "INVENTARIO_HIST": "NOMBRE"}
 SCOPES = [
@@ -334,7 +337,7 @@ def tasa_usdt():
 
 
 RESPALDO_TABS = ["INVENTARIO", "VENTAS", "ENCARGOS", "CAJA", "GASTOS", "MOVIMIENTOS", "LOTES",
-                 "CONTACTOS", "CONFIG"]
+                 "CONTACTOS", "CONFIG", "FINANZAS_HIST"]
 RESPALDO_DIAS = 30
 
 
@@ -1591,7 +1594,38 @@ TELEFONOS = dict(zip(contactos["PERSONA"].astype(str).str.upper(), contactos["TE
 MSG_COBRO = str(_cfg.get("MSG_COBRO") or "") or MSG_COBRO_DEFECTO
 PEND = ENC[~ENC["ESTA_PAGADO"]]
 
-SECCIONES = ["📊 Dashboard", "⚡ Venta rápida", "🧾 Ventas", "📦 Inventario", "📣 Promocionar",
+
+def valor_negocio():
+    """Lo que vale el negocio hoy, en dólares: caja + lo que te deben + mercancía al costo."""
+    caja_usd = float(CAJA["MONTO_USD"].fillna(0).sum()) if len(CAJA) else 0.0
+    cobrar_usd = float(PEND["SALDO_USD"].fillna(0).sum()) if len(PEND) else 0.0
+    valor = INV["EXISTENCIA"].clip(lower=0) * pd.to_numeric(INV["PRECIO_COMPRA"],
+                                                            errors="coerce").fillna(0)
+    inv_usd = float(valor.sum())
+    camino_usd = float(valor[INV["EN_CAMINO"]].sum()) if "EN_CAMINO" in INV else 0.0
+    return {"caja": caja_usd, "cobrar": cobrar_usd, "inventario": inv_usd,
+            "en_camino": camino_usd, "total": caja_usd + cobrar_usd + inv_usd}
+
+
+# una foto al día del valor del negocio, para ver cómo crece con el tiempo
+if not st.session_state.get("foto_finanzas"):
+    st.session_state["foto_finanzas"] = True
+    try:
+        _hist = leer("FINANZAS_HIST")
+        _hoy = pd.Timestamp(hoy())
+        _ya = pd.to_datetime(_hist["FECHA"], errors="coerce").dt.normalize().eq(_hoy).any() \
+            if len(_hist) else False
+        if not _ya and TASA_VAL:
+            _v = valor_negocio()
+            anexar("FINANZAS_HIST", [{"FECHA": _hoy, "CAJA": round(_v["caja"], 2),
+                                      "POR_COBRAR": round(_v["cobrar"], 2),
+                                      "INVENTARIO": round(_v["inventario"], 2),
+                                      "TOTAL": round(_v["total"], 2)}])
+    except Exception as e:                     # nunca frena la app
+        st.session_state["foto_finanzas_error"] = str(e)
+
+SECCIONES = ["📊 Dashboard", "💰 Finanzas", "⚡ Venta rápida", "🧾 Ventas", "📦 Inventario",
+             "📣 Promocionar",
              "🎁 Por cobrar", "🚚 Gastos", "💵 Caja Chica", "📈 Rotación", "🏛️ Histórico"]
 
 
@@ -2806,6 +2840,240 @@ elif seccion == "📦 Inventario":
 # --------------------------------------------------------------------------
 # ENCARGOS Y PRESTAMOS
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# FINANZAS: cómo va el dinero
+# --------------------------------------------------------------------------
+elif seccion == "💰 Finanzas":
+    st.header("💰 Finanzas")
+    st.caption(f"Todo en dólares. Los bolívares se convierten a {plata(TASA_VAL, 'Bs')} por "
+               f"dólar ({TASA_VAL_NOMBRE}); se cambia en la barra lateral."
+               if TASA_VAL else "Sin tasa para convertir bolívares: se dejan fuera.")
+    hoy_f = pd.Timestamp(hoy())
+    mes_actual = hoy_f.to_period("M")
+
+    # ---------------- 1. cuánto vale el negocio ----------------
+    st.subheader("1 · ¿Cuánto vale tu negocio hoy?")
+    vn = valor_negocio()
+    k = st.columns(4)
+    k[0].metric("Valor total", money(vn["total"]))
+    k[1].metric("En caja", money(vn["caja"]))
+    k[2].metric("Te deben", money(vn["cobrar"]))
+    k[3].metric("Mercancía (al costo)", money(vn["inventario"]),
+                f"{money(vn['en_camino'])} en camino" if vn["en_camino"] else None,
+                delta_color="off")
+    partes = pd.DataFrame({"Parte": ["En caja", "Te deben", "Mercancía"],
+                           "Monto": [vn["caja"], vn["cobrar"], vn["inventario"]]})
+    fig = px.bar(partes, x="Monto", y=["Valor"] * 3, color="Parte", orientation="h",
+                 text=partes["Monto"].map(money),
+                 color_discrete_map={"En caja": "#5A97AC", "Te deben": "#F7AEC2",
+                                     "Mercancía": "#AE5166"})
+    fig.update_layout(height=120, margin=dict(l=0, r=0, t=0, b=0), barmode="stack",
+                      yaxis_title=None, xaxis_title=None, yaxis_showticklabels=False,
+                      legend=dict(orientation="h", y=-0.35, title=None))
+    st.plotly_chart(fig, width="stretch")
+    if len(PEND):
+        f_pend = pd.to_datetime(PEND["FECHA"], errors="coerce")
+        viejas = PEND[(hoy_f - f_pend).dt.days > 60]
+        monto_viejo = float(viejas["SALDO_USD"].fillna(0).sum())
+        if monto_viejo > 0:
+            st.caption(f"⚠️ De lo que te deben, **{money(monto_viejo)}** tiene más de 60 días "
+                       f"({len(viejas)} cuentas). Mientras no lo cobres, es plata que no puedes usar.")
+    hist = leer("FINANZAS_HIST")
+    if len(hist) >= 2:
+        h = hist.assign(FECHA=pd.to_datetime(hist["FECHA"], errors="coerce")).dropna(subset=["FECHA"])
+        h = h.sort_values("FECHA")
+        fig = px.line(h, x="FECHA", y=["TOTAL", "CAJA", "POR_COBRAR", "INVENTARIO"], markers=True,
+                      color_discrete_map={"TOTAL": "#2E3B42", "CAJA": "#5A97AC",
+                                          "POR_COBRAR": "#F7AEC2", "INVENTARIO": "#AE5166"})
+        fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="$",
+                          xaxis_title=None, legend_title=None)
+        st.plotly_chart(fig, width="stretch")
+    else:
+        st.caption("📸 Desde hoy la app guarda una foto diaria de estos números; en unos días "
+                   "verás aquí cómo crece tu negocio.")
+
+    # ---------------- 2. cuánto ganaste ----------------
+    st.subheader("2 · ¿Cuánto ganaste?")
+    ven_m = VEN.dropna(subset=["FECHA"]).copy()
+    ven_m["P"] = ven_m["FECHA"].dt.to_period("M")
+    enc_m = ENC.copy()
+    if len(enc_m):
+        cuando = pd.to_datetime(enc_m["ULT_ABONO"], errors="coerce").fillna(
+            pd.to_datetime(enc_m["FECHA"], errors="coerce"))
+        enc_m["P"] = cuando.dt.to_period("M")
+    gas_m = GAS.copy()
+    if len(gas_m):
+        gas_m["P"] = pd.to_datetime(gas_m["FECHA"], errors="coerce").dt.to_period("M")
+    meses = sorted(set(ven_m["P"].dropna())
+                   | (set(enc_m["P"].dropna()) if len(enc_m) else set())
+                   | (set(gas_m["P"].dropna()) if len(gas_m) else set()) | {mes_actual})
+    filas_m = []
+    for per in meses:
+        v_ = ven_m[ven_m["P"] == per]
+        g_ = gas_m[gas_m["P"] == per] if len(gas_m) else gas_m
+        e_ = enc_m[enc_m["P"] == per] if len(enc_m) else enc_m
+        ventas_ = float(v_["MONTO"].sum())
+        costo_ = float(v_["COSTO"].fillna(0).sum())
+        enc_g = float(e_["GAN_COBRADA_USD"].fillna(0).sum()) if len(e_) else 0.0
+        gas_g = float(g_["MONTO_USD"].fillna(0).sum()) if len(g_) else 0.0
+        filas_m.append({"MES": per, "VENTAS": ventas_, "COSTO": costo_,
+                        "GAN_REVENTA": ventas_ - costo_, "GAN_ENCARGOS": enc_g, "GASTOS": gas_g,
+                        "GANANCIA": ventas_ - costo_ + enc_g - gas_g,
+                        "SIN_COSTO": int((~v_["EN_INVENTARIO"]).sum()) if len(v_) else 0})
+    pyg = pd.DataFrame(filas_m)
+    nombres_mes = {per: f"{['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'][per.month - 1]} {per.year}"
+                   for per in pyg["MES"]}
+    mes_sel = st.selectbox("Mes", list(reversed(pyg["MES"].tolist())), key="fin_mes",
+                           format_func=lambda per: nombres_mes[per].capitalize()
+                           + (" (en curso)" if per == mes_actual else ""))
+    fila = pyg[pyg["MES"] == mes_sel].iloc[0]
+    previa = pyg[pyg["MES"] == mes_sel - 1]
+    previa = previa.iloc[0] if len(previa) else None
+    dif = lambda col: (money(fila[col] - previa[col]) + " vs mes anterior") if previa is not None else None
+    k = st.columns(4)
+    k[0].metric("Vendiste", money(fila["VENTAS"]), dif("VENTAS"))
+    k[1].metric("Te costó lo vendido", money(fila["COSTO"]))
+    k[2].metric("Gastos", money(fila["GASTOS"]), dif("GASTOS"), delta_color="inverse")
+    k[3].metric("Ganancia del mes", money(fila["GANANCIA"]), dif("GANANCIA"))
+    detalle = (f"Ganancia de reventa {money(fila['GAN_REVENTA'])}"
+               + (f" + encargos cobrados {money(fila['GAN_ENCARGOS'])}" if fila["GAN_ENCARGOS"] else "")
+               + (f" − gastos {money(fila['GASTOS'])}" if fila["GASTOS"] else "")
+               + f" = **{money(fila['GANANCIA'])}**.")
+    if fila["VENTAS"]:
+        detalle += f" Margen: {fila['GAN_REVENTA'] / fila['VENTAS']:.0%} de lo vendido."
+    if mes_sel == mes_actual:
+        detalle += f" Van {hoy_f.day} días del mes."
+    st.markdown(detalle)
+    if fila["SIN_COSTO"]:
+        st.caption(f"ℹ️ {int(fila['SIN_COSTO'])} ventas de ese mes no son del inventario (no "
+                   "tienen costo cargado) y cuentan completas como ganancia.")
+    graf = pyg.assign(Mes=pyg["MES"].map(lambda per: nombres_mes[per]),
+                      Acumulada=pyg["GANANCIA"].cumsum())
+    fig = go.Figure()
+    fig.add_bar(x=graf["Mes"], y=graf["GANANCIA"], name="Ganancia del mes",
+                marker_color=["#AE5166" if g >= 0 else "#9AA5AA" for g in graf["GANANCIA"]])
+    fig.add_scatter(x=graf["Mes"], y=graf["Acumulada"], name="Ganancia acumulada",
+                    mode="lines+markers", line=dict(color="#5A97AC", width=3))
+    fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="$",
+                      legend=dict(orientation="h", y=1.12, title=None))
+    st.plotly_chart(fig, width="stretch")
+    with st.expander("Ver todos los meses"):
+        st.dataframe(
+            graf[["Mes", "VENTAS", "COSTO", "GAN_REVENTA", "GAN_ENCARGOS", "GASTOS", "GANANCIA",
+                  "Acumulada"]].iloc[::-1],
+            hide_index=True, width="stretch",
+            column_config={c: st.column_config.NumberColumn(n, format="$%.2f") for c, n in
+                           [("VENTAS", "Ventas"), ("COSTO", "Costo"), ("GAN_REVENTA", "Reventa"),
+                            ("GAN_ENCARGOS", "Encargos"), ("GASTOS", "Gastos"),
+                            ("GANANCIA", "Ganancia"), ("Acumulada", "Acumulada")]})
+
+    # ---------------- 3. a dónde se fue la plata ----------------
+    st.subheader("3 · ¿A dónde se fue la plata?")
+    mov = leer("MOVIMIENTOS")
+    if len(mov):
+        mov = mov.assign(FECHA=pd.to_datetime(mov["FECHA"], errors="coerce"))
+        mov = mov[mov["FECHA"].dt.to_period("M") == mes_sel].copy()
+    if not len(mov):
+        st.caption(f"No hay movimientos de caja registrados en {nombres_mes[mes_sel]}. Esta parte "
+                   "sale de la bitácora de Caja Chica: cuenta lo que entró o salió de una cuenta.")
+    else:
+        mon = moneda_norm(mov["MONEDA"])
+        mov["USD"] = pd.to_numeric(mov["MONTO"], errors="coerce").fillna(0) / \
+            mon.map(lambda m_: TASA_VAL if m_ == "Bs" and TASA_VAL else (1.0 if m_ == "$" else float("nan")))
+        conceptos = {"Venta": "Ventas", "Abono": "Cobros de deudas", "Compra": "Compras de mercancía",
+                     "Gasto": "Gastos", "Préstamo": "Préstamos que diste", "Encargo": "Encargos",
+                     "Reversión": "Correcciones", "Manual": "Ajustes a mano"}
+        internas = mov["ORIGEN"].astype(str).eq("Transferencia")
+        flujo = mov[~internas].copy()
+        flujo["Concepto"] = flujo["ORIGEN"].map(conceptos).fillna(flujo["ORIGEN"].astype(str))
+        entradas = float(flujo.loc[flujo["USD"] > 0, "USD"].sum())
+        salidas = float(-flujo.loc[flujo["USD"] < 0, "USD"].sum())
+        k = st.columns(3)
+        k[0].metric("Entró", money(entradas))
+        k[1].metric("Salió", money(salidas))
+        k[2].metric("Diferencia", money(entradas - salidas),
+                    "la caja creció" if entradas >= salidas else "la caja bajó",
+                    delta_color="normal" if entradas >= salidas else "inverse")
+        resumen = (flujo.assign(Tipo=flujo["USD"].map(lambda x: "Entró" if x > 0 else "Salió"))
+                   .groupby(["Concepto", "Tipo"], as_index=False)["USD"].sum())
+        resumen["Monto"] = resumen["USD"].abs()
+        resumen = resumen.sort_values("Monto", ascending=True)
+        fig = px.bar(resumen, x="Monto", y="Concepto", color="Tipo", orientation="h",
+                     text=resumen["Monto"].map(money),
+                     color_discrete_map={"Entró": "#5A97AC", "Salió": "#AE5166"})
+        fig.update_layout(height=max(220, 46 * len(resumen) + 60), margin=dict(l=0, r=0, t=10, b=0),
+                          xaxis_title="$", yaxis_title=None, legend_title=None, barmode="group")
+        st.plotly_chart(fig, width="stretch")
+        notas = []
+        if internas.any():
+            notas.append(f"No cuento {int(internas.sum())} transferencias entre tus cuentas: "
+                         "la plata no sale del negocio.")
+        notas.append("Solo aparece lo que movió la caja: si al registrar algo elegiste «No mover», "
+                     "aquí no está.")
+        st.caption(" ".join(notas))
+        with st.expander("Ver los movimientos"):
+            st.dataframe(flujo.sort_values("FECHA", ascending=False)[
+                ["FECHA", "Concepto", "UBICACION", "USD", "DETALLE"]],
+                hide_index=True, width="stretch",
+                column_config={"FECHA": st.column_config.DatetimeColumn("Fecha", format="DD/MM HH:mm"),
+                               "UBICACION": "Cuenta",
+                               "USD": st.column_config.NumberColumn("Monto", format="$%.2f"),
+                               "DETALLE": "Detalle"})
+
+    # ---------------- 4. cuánto invertir en el próximo lote ----------------
+    st.subheader("4 · ¿Cuánto puedes invertir en el próximo lote?")
+    ult3 = [mes_actual - i for i in range(1, 4)]
+    p3 = pyg[pyg["MES"].isin(ult3)]
+    ritmo_costo = float(p3["COSTO"].mean()) if len(p3) else float(pyg["COSTO"].iloc[-1])
+    gasto_mes = float(p3["GASTOS"].mean()) if len(p3) else 0.0
+    c = st.columns(3)
+    colchon_txt = campo_dinero(c[0], "Quiero dejar siempre en caja ($)", round(gasto_mes, 2),
+                               key="fin_colchon",
+                               ayuda="Para imprevistos y gastos del mes. Por defecto, lo que "
+                                     "gastas en promedio al mes.")
+    meses_stock = c[1].slider("Mercancía para cuántos meses", 1, 4, 2, key="fin_meses",
+                              help="Cuántos meses quieres que te dure el inventario.")
+    contar_cobros = c[2].checkbox("Contar lo que me deben de este mes", value=False,
+                                  key="fin_cobros",
+                                  help="Solo las cuentas de los últimos 30 días, que suelen pagarse pronto.")
+    colchon = leer_monto(colchon_txt) or 0.0
+    cobros_pronto = 0.0
+    if contar_cobros and len(PEND):
+        f_pend = pd.to_datetime(PEND["FECHA"], errors="coerce")
+        cobros_pronto = float(PEND.loc[(hoy_f - f_pend).dt.days <= 30, "SALDO_USD"].fillna(0).sum())
+    disponible = max(vn["caja"] + cobros_pronto - colchon, 0.0)
+    necesitas = max(ritmo_costo * meses_stock - vn["inventario"], 0.0)
+    sugerido = min(disponible, necesitas)
+    k = st.columns(3)
+    k[0].metric("Puedes usar", money(disponible),
+                help="Caja" + (" + cobros recientes" if contar_cobros else "") + " − lo que dejas de reserva.")
+    k[1].metric(f"Mercancía que necesitas para {meses_stock} meses", money(necesitas),
+                help="Lo que vendes al mes (al costo) × meses, menos lo que ya tienes.")
+    k[2].metric("Lote sugerido", money(sugerido))
+    if ritmo_costo <= 0:
+        st.caption("Todavía no hay ventas suficientes para calcular tu ritmo.")
+    else:
+        meses_dura = vn["inventario"] / ritmo_costo
+        txt = (f"En los últimos meses vendes en promedio **{money(ritmo_costo)}** al costo por mes. "
+               f"La mercancía que tienes ({money(vn['inventario'])}) te alcanza para unos "
+               f"**{meses_dura:.1f} meses**. ")
+        if necesitas <= 0:
+            txt += "Con eso cubres lo que pediste: no hace falta comprar todavía."
+        elif disponible >= necesitas:
+            txt += f"Te alcanza para un lote de **{money(necesitas)}** sin tocar tu reserva."
+        else:
+            txt += (f"Para cubrir {meses_stock} meses necesitarías {money(necesitas)}, pero sin "
+                    f"tocar la reserva solo puedes poner **{money(disponible)}**.")
+            if vn["cobrar"] > 0:
+                txt += f" Cobrar parte de los {money(vn['cobrar'])} que te deben lo resolvería."
+        st.markdown(txt)
+    costo_lotes = (INV.assign(C=pd.to_numeric(INV["CANTIDAD"], errors="coerce").fillna(0)
+                              * pd.to_numeric(INV["PRECIO_COMPRA"], errors="coerce").fillna(0))
+                   .dropna(subset=["LOTE"]).groupby("LOTE")["C"].sum().sort_index().tail(3))
+    if len(costo_lotes):
+        st.caption("Como referencia, tus últimos lotes costaron: "
+                   + " · ".join(f"lote {_ent(l_)}: {money(c_)}" for l_, c_ in costo_lotes.items()) + ".")
+
 # --------------------------------------------------------------------------
 # VENTA RÁPIDA (pensada para el teléfono)
 # --------------------------------------------------------------------------
