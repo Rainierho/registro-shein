@@ -104,7 +104,7 @@ def pasarela(fuentes, alto=320):
     pagina = f"""
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}} html,body{{background:transparent;overflow:hidden}}
-.w{{position:relative;height:{alto}px;border-radius:10px;overflow:hidden;background:rgba(128,128,128,.08)}}
+.w{{position:relative;height:{alto}px;border-radius:12px;overflow:hidden;background:rgba(161,202,220,.18)}}
 .t{{display:flex;height:100%;overflow-x:auto;scroll-snap-type:x mandatory;scrollbar-width:none;
    -webkit-overflow-scrolling:touch;scroll-behavior:smooth}}
 .t::-webkit-scrollbar{{display:none}}
@@ -238,11 +238,116 @@ WHATSAPP = wa_numero(conf.get("CATALOGO_WHATSAPP"))
 MOSTRAR_USDT = str(conf.get("CATALOGO_PRECIO_USDT") or "").upper() == "SI"
 TASA_USDT = tasa_usdt() if MOSTRAR_USDT else None
 
-st.set_page_config(page_title=NOMBRE, page_icon="🛍️", layout="wide")
+st.set_page_config(page_title=NOMBRE, page_icon="🛍️", layout="wide",
+                   initial_sidebar_state="collapsed")
+
+# ---------------------------------------------------------------------------
+# Presentación: paleta de Lyho Shop, logo y versión para teléfono
+# ---------------------------------------------------------------------------
+import base64
+import html as _html
+import pathlib
+import re
+
+PALETA = {"teal": "#5A97AC", "celeste": "#A1CADC", "crema": "#EEEDE9", "rosa": "#F7AEC2",
+          "vino": "#AE5166", "texto": "#2E3B42"}
+RUTA_LOGO = pathlib.Path(__file__).resolve().parent / "assets" / "logo_lyhoshop.png"
+
+
+@st.cache_data(show_spinner=False)
+def logo_b64(ruta):
+    try:
+        return base64.b64encode(pathlib.Path(ruta).read_bytes()).decode()
+    except OSError:
+        return None
+
+
+def es_movil():
+    """Teléfono según el navegador. ?vista=movil o ?vista=pc lo fuerzan (para probar)."""
+    forzada = str(st.query_params.get("vista", "")).lower()
+    if forzada in ("movil", "móvil", "pc"):
+        return forzada != "pc"
+    try:
+        agente = st.context.headers.get("User-Agent", "") or ""
+    except Exception:
+        agente = ""
+    return bool(re.search(r"Mobi|Android|iPhone|iPod", agente))
+
+
+MOVIL = es_movil()
+ALTO_FOTO = 210 if MOVIL else 300
+
+css = f"""
+:root{{--teal:{PALETA['teal']};--celeste:{PALETA['celeste']};--crema:{PALETA['crema']};
+      --rosa:{PALETA['rosa']};--vino:{PALETA['vino']};--texto:{PALETA['texto']}}}
+.stApp{{background:var(--crema)}}
+[data-testid="stAppHeader"],[data-testid="stHeader"]{{display:none!important}}
+[data-testid="stToolbar"],[data-testid="stDecoration"],#MainMenu,footer{{display:none!important}}
+[data-testid="stMainBlockContainer"]{{padding-top:1rem;max-width:1180px}}
+.lyho-cab{{background:linear-gradient(135deg,var(--teal),#467F94);border-radius:20px;
+  padding:22px 16px 18px;text-align:center;box-shadow:0 6px 18px rgba(46,59,66,.18)}}
+.lyho-cab img{{width:min(430px,90%);height:auto;filter:drop-shadow(0 3px 4px rgba(0,0,0,.25))}}
+.lyho-cab h1{{color:#fff;margin:0}}
+.lyho-wa{{display:inline-block;margin-top:12px;background:var(--rosa);color:var(--texto)!important;
+  text-decoration:none!important;font-weight:700;padding:8px 18px;border-radius:999px}}
+.lyho-cuenta{{color:var(--teal);font-weight:700;margin:14px 2px 0}}
+[class*="st-key-tarjeta_"]{{background:#fff;border:1px solid rgba(174,81,102,.16);border-radius:16px;
+  padding:10px 10px 12px;box-shadow:0 3px 10px rgba(46,59,66,.08)}}
+[class*="st-key-tarjeta_"] [data-testid="stImage"] img{{height:{ALTO_FOTO}px;width:100%;
+  object-fit:contain;background:rgba(161,202,220,.18);border-radius:12px}}
+.lyho-nom{{font-weight:700;color:var(--texto);line-height:1.25;margin:4px 0 2px}}
+.lyho-desc{{color:#6B777D;font-size:.82rem;line-height:1.3;margin:0 0 4px}}
+.lyho-precio{{color:var(--vino);font-weight:800;font-size:1.4rem;line-height:1.2}}
+.lyho-bs{{color:var(--teal);font-weight:700;font-size:.85rem}}
+.lyho-chip{{display:inline-block;font-size:.72rem;font-weight:700;padding:2px 9px;border-radius:999px;
+  background:var(--rosa);color:var(--vino);margin:4px 0 2px}}
+.lyho-chip.ok{{background:rgba(161,202,220,.45);color:#3F7184}}
+[data-testid="stBaseLinkButton-primary"]{{background:var(--vino)!important;border-color:var(--vino)!important;
+  color:#fff!important;border-radius:999px!important;font-weight:700}}
+[data-testid="stBaseLinkButton-primary"]:hover{{filter:brightness(.93)}}
+.lyho-flot{{position:fixed;right:18px;bottom:18px;z-index:999;background:#25D366;color:#fff!important;
+  text-decoration:none!important;font-weight:700;padding:12px 20px;border-radius:999px;
+  box-shadow:0 6px 16px rgba(0,0,0,.25)}}
+.lyho-pie{{color:#7C878C;font-size:.8rem;text-align:center;margin:18px 0 70px}}
+"""
+if MOVIL:
+    css += """
+[data-testid="stMainBlockContainer"]{padding:.55rem .5rem 5.5rem!important}
+.lyho-cab{padding:16px 10px 14px;border-radius:16px}
+.st-key-grilla [data-testid="stHorizontalBlock"]{flex-wrap:nowrap!important;gap:.5rem!important}
+.st-key-grilla [data-testid="stColumn"]{min-width:0!important;width:calc(50% - .25rem)!important;
+  flex:1 1 0!important}
+[class*="st-key-tarjeta_"]{padding:6px 6px 9px;border-radius:14px}
+.lyho-nom{font-size:.86rem}
+.lyho-precio{font-size:1.12rem}
+.lyho-bs{font-size:.76rem}
+[data-testid="stBaseLinkButton-primary"]{font-size:.84rem!important;padding:.3rem .4rem!important;
+  min-height:2.1rem!important}
+.lyho-flot{left:12px;right:12px;bottom:12px;text-align:center;padding:13px 16px}
+"""
+st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+
+
+def cabecera(total):
+    b64 = logo_b64(str(RUTA_LOGO))
+    marca = (f'<img src="data:image/png;base64,{b64}" alt="{_html.escape(NOMBRE)}">' if b64
+             else f"<h1>{_html.escape(NOMBRE)}</h1>")
+    wa = ""
+    if WHATSAPP:
+        visible = f"0{WHATSAPP[2:5]}-{WHATSAPP[5:]}"            # 584141234567 -> 0414-1234567
+        hola = quote("¡Hola! Vi tu catálogo y quiero hacer un pedido.")
+        wa = (f'<a class="lyho-wa" href="https://wa.me/{WHATSAPP}?text={hola}" target="_blank">'
+              f"📲 Escríbenos: {visible}</a>")
+    st.markdown(f'<div class="lyho-cab">{marca}<br>{wa}</div>', unsafe_allow_html=True)
+    cuenta = f"{total} productos disponibles" if total != 1 else "1 producto disponible"
+    st.markdown(f'<div class="lyho-cuenta">{cuenta}'
+                + (" · bolívares a tasa USDT" if TASA_USDT else "") + "</div>",
+                unsafe_allow_html=True)
+
 
 inv, ven = datos["INVENTARIO"], datos["VENTAS"]
 if inv.empty or "NOMBRE" not in inv.columns:
-    st.title(NOMBRE)
+    cabecera(0)
     if BACKEND != "gsheets":
         st.error("El catálogo está en modo Excel local y no encontró el archivo. En "
                  "Streamlit Cloud los Secrets deben decir backend = \"gsheets\".")
@@ -275,24 +380,24 @@ FOTOS_PROPIAS = (cargar_fotos(BACKEND, secreto("spreadsheet_id") or secreto("exc
                  if disp["FOTOS_L"].map(lambda l: any(not r.startswith("http") for r in l)).any()
                  else {})
 
-st.title(f"🛍️ {NOMBRE}")
-if WHATSAPP:
-    visible = f"0{WHATSAPP[2:5]}-{WHATSAPP[5:]}"          # 584141234567 -> 0414-1234567
-    hola = quote("¡Hola! Vi tu catálogo y quiero hacer un pedido.")
-    st.markdown(f"📲 **Escríbenos por WhatsApp: "
-                f"[{visible}](https://wa.me/{WHATSAPP}?text={hola})**")
-st.caption((f"{len(disp)} productos disponibles" if len(disp) != 1
-            else "1 producto disponible")
-           + (" · bolívares a tasa USDT" if TASA_USDT else ""))
+cabecera(len(disp))
 
 if disp.empty:
     st.info("Por ahora no hay productos disponibles. ¡Vuelve pronto!")
     st.stop()
 
-c = st.columns([3, 2, 2])
-busq = c[0].text_input("Buscar", placeholder="anillo, collar, reloj…").strip().lower()
-tipos = c[1].multiselect("Tipo", sorted(disp["TIPO"].unique()))
-orden = c[2].selectbox("Ordenar", ["Recomendados", "Menor precio", "Mayor precio", "Nombre"])
+ORDENES = ["Recomendados", "Menor precio", "Mayor precio", "Nombre"]
+if MOVIL:
+    busq = st.text_input("Buscar", placeholder="🔎 Buscar: anillo, collar, reloj…",
+                         label_visibility="collapsed").strip().lower()
+    with st.expander("Filtrar y ordenar"):
+        tipos = st.multiselect("Tipo", sorted(disp["TIPO"].unique()), placeholder="Todos")
+        orden = st.selectbox("Ordenar", ORDENES)
+else:
+    c = st.columns([3, 2, 2])
+    busq = c[0].text_input("Buscar", placeholder="anillo, collar, reloj…").strip().lower()
+    tipos = c[1].multiselect("Tipo", sorted(disp["TIPO"].unique()), placeholder="Todos")
+    orden = c[2].selectbox("Ordenar", ORDENES)
 
 v = disp
 if busq:
@@ -313,37 +418,54 @@ if v.empty:
     st.info("No hay productos con esa búsqueda.")
     st.stop()
 
-por_fila = 3
-filas = [v.iloc[i:i + por_fila] for i in range(0, len(v), por_fila)]
-for grupo in filas:
-    cols = st.columns(por_fila)
-    for col, (_, p) in zip(cols, grupo.iterrows()):
-        with col.container(border=True):
-            fuentes = [f for f in (fuente_foto(r, p["NOMBRE"]) for r in p["FOTOS_L"]) if f]
-            if len(fuentes) > 1:
-                pasarela(fuentes)
-            elif fuentes:
-                f0 = fuentes[0]
-                if f0.startswith("data:"):
-                    import base64
-                    f0 = base64.b64decode(f0.split(",", 1)[1])
-                st.image(f0, width="stretch")
-            st.markdown(f"**{p['NOMBRE'].title()}**")
-            desc = str(p["DESCRIPCION"]).strip()
-            if desc:
-                st.caption(desc[:140] + ("…" if len(desc) > 140 else ""))
-            precio = ve(p["PRECIO"], "$")
-            if TASA_USDT:
-                precio += f"  ·  {ve(p['PRECIO'] * TASA_USDT, 'Bs')}"
-            st.markdown(f"### {precio}" if not TASA_USDT else f"#### {precio}")
-            st.caption("🔥 ¡Última unidad!" if p["QUEDAN"] == 1
-                       else ("Quedan pocas" if p["QUEDAN"] <= 2 else "Disponible"))
-            if WHATSAPP:
-                ref = ve(p["PRECIO"], "$") + (f" / {ve(p['PRECIO'] * TASA_USDT, 'Bs')}"
-                                               if TASA_USDT else "")
-                msg = f"¡Hola! Me interesa *{p['NOMBRE'].title()}* ({ref}) que vi en el catálogo."
-                st.link_button("📲 Lo quiero", f"https://wa.me/{WHATSAPP}?text={quote(msg)}",
-                               width="stretch")
 
-st.divider()
-st.caption("Las existencias se actualizan cada pocos minutos. Escríbenos para confirmar.")
+def tarjeta(p, k):
+    with st.container(key=f"tarjeta_{k}"):
+        fuentes = [f for f in (fuente_foto(r, p["NOMBRE"]) for r in p["FOTOS_L"]) if f]
+        if len(fuentes) > 1:
+            pasarela(fuentes, alto=ALTO_FOTO)
+        elif fuentes:
+            f0 = fuentes[0]
+            if f0.startswith("data:"):
+                f0 = base64.b64decode(f0.split(",", 1)[1])
+            st.image(f0, width="stretch")
+        nombre = _html.escape(p["NOMBRE"].title())
+        desc = str(p["DESCRIPCION"]).strip()
+        bloque = f'<div class="lyho-nom">{nombre}</div>'
+        if desc and not MOVIL:
+            corto = desc[:110] + ("…" if len(desc) > 110 else "")
+            bloque += f'<div class="lyho-desc">{_html.escape(corto)}</div>'
+        bloque += f'<div class="lyho-precio">{ve(p["PRECIO"], "$")}</div>'
+        if TASA_USDT:
+            bloque += f'<div class="lyho-bs">{ve(p["PRECIO"] * TASA_USDT, "Bs")}</div>'
+        if p["QUEDAN"] == 1:
+            bloque += '<span class="lyho-chip">🔥 ¡Última unidad!</span>'
+        elif p["QUEDAN"] <= 2:
+            bloque += '<span class="lyho-chip">Quedan pocas</span>'
+        else:
+            bloque += '<span class="lyho-chip ok">Disponible</span>'
+        st.markdown(bloque, unsafe_allow_html=True)
+        if WHATSAPP:
+            ref = ve(p["PRECIO"], "$") + (f" / {ve(p['PRECIO'] * TASA_USDT, 'Bs')}"
+                                           if TASA_USDT else "")
+            msg = f"¡Hola! Me interesa *{p['NOMBRE'].title()}* ({ref}) que vi en el catálogo."
+            st.link_button("📲 Lo quiero", f"https://wa.me/{WHATSAPP}?text={quote(msg)}",
+                           type="primary", width="stretch")
+
+
+por_fila = 2 if MOVIL else 3
+with st.container(key="grilla"):
+    k = 0
+    for i in range(0, len(v), por_fila):
+        cols = st.columns(por_fila)
+        for col, (_, p) in zip(cols, v.iloc[i:i + por_fila].iterrows()):
+            with col:
+                tarjeta(p, k)
+            k += 1
+
+st.markdown('<div class="lyho-pie">Las existencias se actualizan cada pocos minutos. '
+            "Escríbenos para confirmar tu pedido.</div>", unsafe_allow_html=True)
+if WHATSAPP:
+    hola = quote("¡Hola! Vi tu catálogo y quiero hacer un pedido.")
+    st.markdown(f'<a class="lyho-flot" href="https://wa.me/{WHATSAPP}?text={hola}" '
+                'target="_blank">💬 Pedir por WhatsApp</a>', unsafe_allow_html=True)

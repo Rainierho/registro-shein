@@ -98,6 +98,18 @@ UNIT
 }
 crear_servicio lyho-app      app.py      8501 "registro (app.lyhoshop.com)"
 crear_servicio lyho-catalogo catalogo.py 8502 "catálogo (lyhoshop.com)"
+
+# Tema del catálogo: paleta de Lyho Shop y siempre claro, aunque el teléfono del cliente
+# esté en modo oscuro. Solo para el catálogo; la app de registro queda como está.
+mkdir -p /etc/systemd/system/lyho-catalogo.service.d
+cat > /etc/systemd/system/lyho-catalogo.service.d/tema.conf <<'TEMA'
+[Service]
+Environment=STREAMLIT_THEME_BASE=light
+Environment=STREAMLIT_THEME_PRIMARY_COLOR=#AE5166
+Environment=STREAMLIT_THEME_BACKGROUND_COLOR=#EEEDE9
+Environment=STREAMLIT_THEME_SECONDARY_BACKGROUND_COLOR=#FFFFFF
+Environment=STREAMLIT_THEME_TEXT_COLOR=#2E3B42
+TEMA
 systemctl daemon-reload
 systemctl enable lyho-app lyho-catalogo >/dev/null 2>&1
 
