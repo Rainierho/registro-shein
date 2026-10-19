@@ -747,6 +747,140 @@ def quitar_foto(nombre, ref):
     _escribir_fotos(nombre, refs)
 
 
+NO_SUBIR = "— no subir"
+_PALABRAS_SUELTAS = {"de", "del", "la", "el", "los", "las", "con", "y", "en", "para"}
+
+
+def leer_lote_fotos(archivos):
+    """Imágenes sueltas o .zip -> {grupo: [(archivo, bytes), ...]} en orden de foto.
+    «ANILLO DRAGON.jpeg», «ANILLO DRAGON 02.jpeg»… forman el grupo «ANILLO DRAGON»;
+    la que no lleva número va primero."""
+    import zipfile
+    piezas = []
+    for a in archivos or []:
+        datos = a.getvalue()
+        if a.name.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(datos)) as z:
+                    for info in z.infolist():
+                        base = info.filename.replace("\\", "/").rsplit("/", 1)[-1]
+                        if (info.is_dir() or base.startswith(".") or "__MACOSX" in info.filename
+                                or base.lower().rsplit(".", 1)[-1] not in ("jpg", "jpeg", "png", "webp")):
+                            continue
+                        piezas.append((base, z.read(info)))
+            except zipfile.BadZipFile:
+                continue
+        else:
+            piezas.append((a.name, datos))
+    grupos = {}
+    for archivo, datos in piezas:
+        tallo = archivo.rsplit(".", 1)[0].strip()
+        m = re.match(r"^(.*?)[\s_\-]*\(?(\d{1,3})\)?$", tallo)
+        clave, orden = ((m.group(1).strip(), int(m.group(2))) if m and m.group(1).strip()
+                        else (tallo, 1))
+        grupos.setdefault(clave.upper(), []).append((orden, archivo, datos))
+    return {k: [(a, d) for _, a, d in sorted(v, key=lambda x: (x[0], x[1]))]
+            for k, v in sorted(grupos.items())}
+
+
+def _tokens(texto):
+    return [w for w in re.findall(r"[a-z0-9]+", _norm(texto)) if w not in _PALABRAS_SUELTAS]
+
+
+def sugerir_producto(grupo, nombres):
+    """Producto que corresponde a un grupo de fotos, tolerando errores de tipeo
+    (LENCDERIA, CHOCER, PLAT4EADO). Devuelve (sugerido o "", candidatos para elegir)."""
+    import difflib
+    g = _tokens(grupo)
+    if not g:
+        return "", []
+    filas = []
+    for n in nombres:
+        t = _tokens(n)
+        if not t:
+            continue
+        # cuánto se parecen las palabras: más exigente en las cortas (CARGO no es LARGO),
+        # más tolerante en las largas (LECENDERIA es LENCERIA)
+        umbral = lambda w: 0.85 if len(w) <= 5 else (0.75 if len(w) >= 8 else 0.8)
+        cubre = sum(max(difflib.SequenceMatcher(None, w, x).ratio() for x in t) >= umbral(w)
+                    for w in g) / len(g)
+        parecido = difflib.SequenceMatcher(None, " ".join(g), " ".join(t)).ratio()
+        filas.append((cubre, parecido, n))
+    filas.sort(reverse=True)
+    completos = [f for f in filas if f[0] >= 0.999]
+    if completos:
+        if completos[0][1] >= 0.999 and (len(completos) == 1 or completos[1][1] < 0.999):
+            return completos[0][2], [completos[0][2]]           # nombre idéntico
+        if len(completos) == 1 or completos[0][1] - completos[1][1] >= 0.15:
+            return completos[0][2], [f[2] for f in completos[:3]]
+        return "", [f[2] for f in completos[:4]]              # varios igual de buenos
+    return "", [f[2] for f in filas[:3] if f[0] >= 0.5]
+
+
+def miniatura(datos, lado=110):
+    """Imagen -> data URI pequeño para ver en la tabla."""
+    import base64
+    from PIL import Image, ImageOps
+    try:
+        im = ImageOps.exif_transpose(Image.open(io.BytesIO(datos))).convert("RGB")
+        im.thumbnail((lado, lado))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=70)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return None
+
+
+def agregar_fotos_lote(asignaciones, reemplazar=False, progreso=None):
+    """{producto: [(archivo, bytes), ...]} -> guarda todo en dos escrituras (FOTOS e
+    INVENTARIO), no una por foto. Devuelve (fotos puestas, archivos rechazados, sin lugar)."""
+    import uuid
+    inv = leer("INVENTARIO")
+    fotos = leer("FOTOS")
+    ids = (fotos["ID"].astype(str).str.strip() if "ID" in fotos.columns
+           else pd.Series("", index=fotos.index))
+    nuevas, malos, sin_lugar = [], [], 0
+    borrar_ids, borrar_viejas = set(), set()
+    total = sum(len(v) for v in asignaciones.values()) or 1
+    hechas = 0
+    for nombre, imgs in asignaciones.items():
+        m = inv["NOMBRE"] == nombre
+        if not m.any():
+            continue
+        actuales = fotos_de(inv.loc[m, "FOTO"].iloc[0])
+        if reemplazar:
+            for r in actuales:
+                if r.startswith("propia:"):
+                    borrar_ids.add(r[len("propia:"):])
+                elif r == FOTO_PROPIA:
+                    borrar_viejas.add(nombre)
+            refs = []
+        else:
+            refs = list(actuales)
+        for archivo, datos in imgs:
+            hechas += 1
+            if progreso:
+                progreso(hechas / total, f"{nombre}: {archivo}")
+            if len(refs) >= MAX_FOTOS:
+                sin_lugar += 1
+                continue
+            b64 = comprimir_foto(datos)
+            if b64 is None:
+                malos.append(archivo)
+                continue
+            id_ = uuid.uuid4().hex[:10]
+            nuevas.append({"NOMBRE": nombre, "IMG": b64, "ID": id_})
+            refs.append(f"propia:{id_}")
+        inv.loc[m, "FOTO"] = SEP_FOTOS.join(refs)
+    if borrar_ids or borrar_viejas:
+        quedan = fotos[~(ids.isin(borrar_ids) | (fotos["NOMBRE"].isin(borrar_viejas) & (ids == "")))]
+        guardar("FOTOS", pd.concat([quedan, pd.DataFrame(nuevas)], ignore_index=True))
+    elif nuevas:
+        anexar("FOTOS", nuevas)
+    guardar("INVENTARIO", inv)
+    return len(nuevas), malos, sin_lugar
+
+
 def hacer_principal(nombre, ref):
     inv = leer("INVENTARIO")
     actual = inv.loc[inv["NOMBRE"] == nombre, "FOTO"]
@@ -2167,97 +2301,199 @@ elif seccion == "📦 Inventario":
     en_venta = INV[(INV["EXISTENCIA"] > 0) & (INV["OCULTAR"].astype(str).str.upper() != "SI")]
     n_sin_foto = int((~tiene_foto(en_venta["FOTO"])).sum())
     with st.expander(f"📷 Fotos de productos ({n_sin_foto} en venta sin foto)"):
-        c = st.columns([2, 1])
-        solo_sin = c[0].checkbox("Solo los que no tienen foto", value=n_sin_foto > 0,
-                                 key="fotos_solo_sin")
-        solo_venta = c[1].checkbox("Solo con existencia", value=True, key="fotos_solo_venta")
-        lista_f = en_venta if solo_venta else INV
-        if solo_sin:
-            lista_f = lista_f[~tiene_foto(lista_f["FOTO"])]
-        if lista_f.empty:
-            st.success("Todos los productos de la lista tienen foto.")
+        modo_fotos = st.radio("Cómo subir", ["Una por una", "Varias a la vez (zip)"],
+                              horizontal=True, label_visibility="collapsed", key="fotos_modo")
+        if modo_fotos == "Varias a la vez (zip)":
+            st.caption("Sube un **.zip** o varias imágenes. Las fotos con el mismo nombre y "
+                       "distinto número (ANILLO DRAGON, ANILLO DRAGON 02…) van al mismo "
+                       "producto, en ese orden: la que no lleva número queda de principal.")
+            n_lote = st.session_state.get("lote_n", 0)
+            archivos_l = st.file_uploader("Fotos o .zip", type=["zip", "jpg", "jpeg", "png", "webp"],
+                                          accept_multiple_files=True, key=f"up_lote_fotos_{n_lote}",
+                                          label_visibility="collapsed")
+            if archivos_l:
+                firma = tuple((a.name, len(a.getvalue())) for a in archivos_l)
+                if st.session_state.get("lote_firma") != firma:
+                    with st.spinner("Leyendo las fotos…"):
+                        grupos_l = leer_lote_fotos(archivos_l)
+                        st.session_state["lote_firma"] = firma
+                        st.session_state["lote_grupos"] = grupos_l
+                        st.session_state["lote_minis"] = {g: miniatura(v[0][1])
+                                                          for g, v in grupos_l.items()}
+                grupos_l = st.session_state["lote_grupos"]
+                minis = st.session_state["lote_minis"]
+                if not grupos_l:
+                    st.warning("No encontré imágenes (jpg, png o webp) en lo que subiste.")
+                else:
+                    nombres_inv = sorted(INV["NOMBRE"])
+                    filas_l = []
+                    for g, imgs in grupos_l.items():
+                        sug, cand = sugerir_producto(g, nombres_inv)
+                        filas_l.append({
+                            "VER": minis.get(g), "GRUPO": g, "FOTOS": len(imgs),
+                            "PRODUCTO": sug or NO_SUBIR,
+                            "ESTADO": ("✅ propuesto" if sug else
+                                       ("🤔 elige" if cand else "❓ sin parecido")),
+                            "OPCIONES": "" if sug else " · ".join(cand),
+                        })
+                    tabla_l = pd.DataFrame(filas_l)
+                    n_sug = int((tabla_l["ESTADO"] == "✅ propuesto").sum())
+                    st.caption(f"{len(tabla_l)} productos en las fotos "
+                               f"({int(tabla_l['FOTOS'].sum())} fotos). Propuse {n_sug}; en el "
+                               "resto elige tú en «Producto ▾» (doble clic). «Puede ser» te "
+                               "muestra los más parecidos. Lo que dejes en «— no subir» se ignora.")
+                    ed_l = st.data_editor(
+                        tabla_l, key=f"ed_lote_{abs(hash(firma))}", hide_index=True,
+                        width="stretch", height=min(42 + 36 * len(tabla_l), 560),
+                        column_order=["VER", "GRUPO", "FOTOS", "PRODUCTO", "ESTADO", "OPCIONES"],
+                        disabled=["VER", "GRUPO", "FOTOS", "ESTADO", "OPCIONES"],
+                        column_config={
+                            "VER": st.column_config.ImageColumn("Foto", width="small"),
+                            "GRUPO": st.column_config.TextColumn("Nombre de las fotos"),
+                            "FOTOS": st.column_config.NumberColumn("Cant.", width="small"),
+                            "PRODUCTO": st.column_config.SelectboxColumn(
+                                "Producto ▾", options=[NO_SUBIR] + nombres_inv, required=True,
+                                width="large"),
+                            "ESTADO": st.column_config.TextColumn("", width="small"),
+                            "OPCIONES": st.column_config.TextColumn("Puede ser", width="large"),
+                        })
+                    asign = {}
+                    for r in ed_l.itertuples():
+                        if r.PRODUCTO and r.PRODUCTO != NO_SUBIR:
+                            asign.setdefault(r.PRODUCTO, []).extend(grupos_l[r.GRUPO])
+                    reemplazar = st.checkbox("Reemplazar las fotos que ya tienen esos productos",
+                                             key="lote_reemplazar",
+                                             help="Si no lo marcas, se agregan a las que ya "
+                                                  f"tienen, hasta {MAX_FOTOS} por producto.")
+                    n_sub = 0
+                    if asign:
+                        ya = {n: len(fotos_de(f)) for n, f in zip(INV["NOMBRE"], INV["FOTO"])}
+                        lineas_l, exceso = [], 0
+                        for n, imgs in sorted(asign.items()):
+                            base = 0 if reemplazar else ya.get(n, 0)
+                            caben = max(MAX_FOTOS - base, 0)
+                            exceso += max(len(imgs) - caben, 0)
+                            n_sub += min(len(imgs), caben)
+                            lineas_l.append(f"**{n}**: {min(len(imgs), caben)} foto(s)"
+                                            + (f" (ya tiene {base})" if base else "")
+                                            + (f" — {len(imgs) - caben} no caben"
+                                               if len(imgs) > caben else ""))
+                        st.markdown("  \n".join(lineas_l))
+                        if exceso:
+                            st.caption(f"⚠️ {exceso} fotos no caben (máximo {MAX_FOTOS} por "
+                                       "producto): se suben las primeras.")
+                    repetidos_l = [n for n, v in asign.items()
+                                   if (ed_l["PRODUCTO"] == n).sum() > 1]
+                    if repetidos_l:
+                        st.caption("ℹ️ Varios grupos van al mismo producto ("
+                                   + ", ".join(repetidos_l[:4]) + "): se juntan sus fotos.")
+                    if st.button(f"📤 Subir {n_sub} fotos a {len(asign)} productos",
+                                 type="primary", disabled=not asign or n_sub == 0,
+                                 key="btn_lote_fotos"):
+                        barra = st.progress(0.0, text="Preparando…")
+                        puestas, malos, sin_lugar = agregar_fotos_lote(
+                            asign, reemplazar,
+                            progreso=lambda f, txt: barra.progress(min(f, 1.0), text=txt))
+                        for k_ in ("lote_firma", "lote_grupos", "lote_minis"):
+                            st.session_state.pop(k_, None)
+                        st.session_state["lote_n"] = n_lote + 1
+                        avisar(f"Subidas {puestas} fotos a {len(asign)} productos. Salen en el "
+                               "catálogo en unos minutos."
+                               + (f" No pude leer: {', '.join(malos[:5])}." if malos else "")
+                               + (f" {sin_lugar} no cabían." if sin_lugar else ""))
+                        st.rerun()
         else:
-            nombres_f = sorted(lista_f["NOMBRE"])
-            prod_f = st.selectbox("Producto", nombres_f, key="fotos_prod")
-            fila_f = INV[INV["NOMBRE"] == prod_f].iloc[0]
-            refs_f = fotos_de(fila_f["FOTO"])
-            if str(fila_f["DESCRIPCION"]).strip():
-                st.caption(str(fila_f["DESCRIPCION"])[:160])
-
-            # ---- galería actual: la primera es la principal ----
-            if refs_f:
-                mapa_f = mapa_fotos() if any(not r.startswith("http") for r in refs_f) else {}
-                st.markdown(f"**Fotos ({len(refs_f)} de {MAX_FOTOS})** — la primera es la "
-                            "principal: la que se ve primero en el catálogo.")
-                cols_f = st.columns(MAX_FOTOS)
-                for i_f, ref_f in enumerate(refs_f):
-                    with cols_f[i_f]:
-                        img = imagen_de(ref_f, prod_f, mapa_f)
-                        if img is not None:
-                            st.image(img, width="stretch",
-                                     caption="⭐ principal" if i_f == 0 else f"{i_f + 1}")
-                        else:
-                            st.caption(f"{i_f + 1}: no se pudo cargar")
-                        if i_f > 0 and st.button("⭐", key=f"pri_{prod_f}_{i_f}",
-                                                 help="Hacerla principal", width="stretch"):
-                            hacer_principal(prod_f, ref_f)
-                            avisar(f"Nueva foto principal para {prod_f}.")
-                            st.rerun()
-                        if st.button("🗑️", key=f"del_{prod_f}_{i_f}", help="Quitar esta foto",
-                                     width="stretch"):
-                            quitar_foto(prod_f, ref_f)
-                            avisar(f"Se quitó una foto de {prod_f}.")
-                            st.rerun()
+            c = st.columns([2, 1])
+            solo_sin = c[0].checkbox("Solo los que no tienen foto", value=n_sin_foto > 0,
+                                     key="fotos_solo_sin")
+            solo_venta = c[1].checkbox("Solo con existencia", value=True, key="fotos_solo_venta")
+            lista_f = en_venta if solo_venta else INV
+            if solo_sin:
+                lista_f = lista_f[~tiene_foto(lista_f["FOTO"])]
+            if lista_f.empty:
+                st.success("Todos los productos de la lista tienen foto.")
             else:
-                st.caption("Sin fotos todavía.")
+                nombres_f = sorted(lista_f["NOMBRE"])
+                prod_f = st.selectbox("Producto", nombres_f, key="fotos_prod")
+                fila_f = INV[INV["NOMBRE"] == prod_f].iloc[0]
+                refs_f = fotos_de(fila_f["FOTO"])
+                if str(fila_f["DESCRIPCION"]).strip():
+                    st.caption(str(fila_f["DESCRIPCION"])[:160])
 
-            # ---- agregar ----
-            if len(refs_f) < MAX_FOTOS:
-                c = st.columns([3, 2])
-                subidas = c[0].file_uploader(
-                    "Subir imágenes (jpg, png o webp) — puedes elegir varias",
-                    type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True,
-                    key=f"up_foto_{prod_f}")
-                enlace = c[1].text_input("…o pegar el enlace de una imagen",
-                                         placeholder="https://…", key=f"url_foto_{prod_f}")
-                hay = bool(subidas) or bool(enlace.strip())
-                if st.button("➕ Agregar fotos", type="primary", key=f"btn_foto_{prod_f}",
-                             disabled=not hay):
-                    libres = MAX_FOTOS - len(refs_f)
-                    puestas, errores = 0, []
-                    for s_ in (subidas or [])[:libres]:
-                        b64 = comprimir_foto(s_.getvalue())
-                        if b64 is None:
-                            errores.append(f"«{s_.name}» no es una imagen que pueda leer")
-                            continue
-                        err = agregar_foto(prod_f, img_b64=b64)
-                        if err:
-                            errores.append(err)
-                            break
-                        puestas += 1
-                    if len(subidas or []) > libres:
-                        errores.append(f"solo cabían {libres}; el resto no se subió")
-                    if enlace.strip():
-                        if not enlace.strip().startswith("http"):
-                            errores.append("el enlace debe empezar por https://")
-                        else:
-                            err = agregar_foto(prod_f, enlace=enlace.strip())
+                # ---- galería actual: la primera es la principal ----
+                if refs_f:
+                    mapa_f = mapa_fotos() if any(not r.startswith("http") for r in refs_f) else {}
+                    st.markdown(f"**Fotos ({len(refs_f)} de {MAX_FOTOS})** — la primera es la "
+                                "principal: la que se ve primero en el catálogo.")
+                    cols_f = st.columns(MAX_FOTOS)
+                    for i_f, ref_f in enumerate(refs_f):
+                        with cols_f[i_f]:
+                            img = imagen_de(ref_f, prod_f, mapa_f)
+                            if img is not None:
+                                st.image(img, width="stretch",
+                                         caption="⭐ principal" if i_f == 0 else f"{i_f + 1}")
+                            else:
+                                st.caption(f"{i_f + 1}: no se pudo cargar")
+                            if i_f > 0 and st.button("⭐", key=f"pri_{prod_f}_{i_f}",
+                                                     help="Hacerla principal", width="stretch"):
+                                hacer_principal(prod_f, ref_f)
+                                avisar(f"Nueva foto principal para {prod_f}.")
+                                st.rerun()
+                            if st.button("🗑️", key=f"del_{prod_f}_{i_f}", help="Quitar esta foto",
+                                         width="stretch"):
+                                quitar_foto(prod_f, ref_f)
+                                avisar(f"Se quitó una foto de {prod_f}.")
+                                st.rerun()
+                else:
+                    st.caption("Sin fotos todavía.")
+
+                # ---- agregar ----
+                if len(refs_f) < MAX_FOTOS:
+                    c = st.columns([3, 2])
+                    subidas = c[0].file_uploader(
+                        "Subir imágenes (jpg, png o webp) — puedes elegir varias",
+                        type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True,
+                        key=f"up_foto_{prod_f}")
+                    enlace = c[1].text_input("…o pegar el enlace de una imagen",
+                                             placeholder="https://…", key=f"url_foto_{prod_f}")
+                    hay = bool(subidas) or bool(enlace.strip())
+                    if st.button("➕ Agregar fotos", type="primary", key=f"btn_foto_{prod_f}",
+                                 disabled=not hay):
+                        libres = MAX_FOTOS - len(refs_f)
+                        puestas, errores = 0, []
+                        for s_ in (subidas or [])[:libres]:
+                            b64 = comprimir_foto(s_.getvalue())
+                            if b64 is None:
+                                errores.append(f"«{s_.name}» no es una imagen que pueda leer")
+                                continue
+                            err = agregar_foto(prod_f, img_b64=b64)
                             if err:
                                 errores.append(err)
+                                break
+                            puestas += 1
+                        if len(subidas or []) > libres:
+                            errores.append(f"solo cabían {libres}; el resto no se subió")
+                        if enlace.strip():
+                            if not enlace.strip().startswith("http"):
+                                errores.append("el enlace debe empezar por https://")
                             else:
-                                puestas += 1
-                    if puestas:
-                        avisar(f"{puestas} foto(s) agregada(s) a {prod_f}. Salen en el catálogo "
-                               "en unos minutos."
-                               + (" Ojo: " + "; ".join(errores) + "." if errores else ""))
-                        st.rerun()
-                    else:
-                        st.error("No se agregó ninguna foto: " + "; ".join(errores) + ".")
-                st.caption("Desde el teléfono, «Subir imágenes» te deja tomar la foto con la "
-                           "cámara. Cada una se reduce sola para que quepa en tu Sheet. Con más "
-                           "de una, en el catálogo se ven como pasarela.")
-            else:
-                st.caption(f"Tiene el máximo de {MAX_FOTOS} fotos. Quita una para agregar otra.")
+                                err = agregar_foto(prod_f, enlace=enlace.strip())
+                                if err:
+                                    errores.append(err)
+                                else:
+                                    puestas += 1
+                        if puestas:
+                            avisar(f"{puestas} foto(s) agregada(s) a {prod_f}. Salen en el catálogo "
+                                   "en unos minutos."
+                                   + (" Ojo: " + "; ".join(errores) + "." if errores else ""))
+                            st.rerun()
+                        else:
+                            st.error("No se agregó ninguna foto: " + "; ".join(errores) + ".")
+                    st.caption("Desde el teléfono, «Subir imágenes» te deja tomar la foto con la "
+                               "cámara. Cada una se reduce sola para que quepa en tu Sheet. Con más "
+                               "de una, en el catálogo se ven como pasarela.")
+                else:
+                    st.caption(f"Tiene el máximo de {MAX_FOTOS} fotos. Quita una para agregar otra.")
 
     with st.expander(f"🚚 Lotes en camino ({len(EN_CAMINO)})", expanded=bool(EN_CAMINO)):
         st.caption("Los productos de un lote en camino no salen en el catálogo. Cuando llegue, "
