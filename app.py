@@ -3589,7 +3589,7 @@ elif seccion == "🎁 Por cobrar":
                             "COSTO": prestado, "COBRAR": total, "ABONADO": abonado,
                             "MONEDA": mon, "FECHA": pd.Timestamp(fecha),
                             "ULT_ABONO": pd.Timestamp(fecha) if abonado else None,
-                            "NOTA": nota, "FOTO": foto_enc.strip(),
+                            "NOTA": nota, "FOTO": "",
                         })
                         extra = aplicar_caja(ubic, delta, "Préstamo", persona)
                         dif = total - prestado
